@@ -198,14 +198,14 @@ class RetrievalDataset(MassSpecDataset):
             with open(self.candidates_pth, "r") as file:
                 self.candidates = json.load(file)
 
-    def __getitem__(self, i) -> dict:
+    def __getitem__(self, i, return_candidates: bool = True) -> dict:
         item = super().__getitem__(i, transform_mol=False)
 
         # Save the original SMILES representation of the query molecule (for evaluation)
         item["smiles"] = item["mol"]
 
         # Get candidates
-        if self.candidates_pth is not None:
+        if return_candidates:
             if item["mol"] not in self.candidates:
                 raise ValueError(f'No candidates for the query molecule {item["mol"]}.')
             candidates = self.candidates[item["mol"]]
@@ -234,11 +234,12 @@ class RetrievalDataset(MassSpecDataset):
         # Transform the query and candidate molecules
         for key, transform in mol_transform.items():
             item[key] = transform(item["mol"]) if transform is not None else item["mol"]
+            if isinstance(item[key], np.ndarray):
+                item[key] = torch.as_tensor(item[key], dtype=self.dtype)
 
-            if self.candidates_pth is not None:
+            if return_candidates:
                 item["candidates_"+key] = [transform(c) if transform is not None else c for c in candidates]
                 if isinstance(item[key], np.ndarray):
-                    item[key] = torch.as_tensor(item[key], dtype=self.dtype)
                     item["candidates_"+key] = torch.as_tensor(np.stack(item["candidates_"+key]), dtype=self.dtype)
 
         return item
@@ -286,9 +287,10 @@ class RetrievalDataset(MassSpecDataset):
                     collated_batch[k] = default_collate([item[k] for item in batch])
 
         # Store the batch pointer reflecting the number of candidates per sample
-        collated_batch["batch_ptr"] = torch.as_tensor(
-            [len(item["candidates_smiles"]) for item in batch]
-        )
+        if "candidates_smiles" in collated_batch:
+            collated_batch["batch_ptr"] = torch.as_tensor(
+                [len(item["candidates_smiles"]) for item in batch]
+            )
 
         return collated_batch
 
