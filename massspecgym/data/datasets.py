@@ -239,7 +239,7 @@ class RetrievalDataset(MassSpecDataset):
 
             if return_candidates:
                 item["candidates_"+key] = [transform(c) if transform is not None else c for c in candidates]
-                if isinstance(item[key], np.ndarray):
+                if isinstance(item["candidates_"+key][0], np.ndarray):
                     item["candidates_"+key] = torch.as_tensor(np.stack(item["candidates_"+key]), dtype=self.dtype)
 
         return item
