@@ -107,6 +107,9 @@ parser.add_argument('--num_layers', type=int, default=2)
 # parser.add_argument('--hidden_channels', type=int, default=512)
 parser.add_argument('--num_layers_per_mlp', type=int, default=2)
 # parser.add_argument('--dropout', type=float, default=0.0)
+parser.add_argument('--fourier_features', dest='fourier_features', action='store_true')
+parser.add_argument('--no_fourier_features', dest='fourier_features', action='store_false')
+parser.set_defaults(fourier_features=True)
 
 # 3. FromDict (for evaluating given fingerprints)
 parser.add_argument('--dct_path', type=str, default=None)
@@ -183,6 +186,7 @@ def main(args):
                 out_channels=args.fp_size,
                 num_layers_per_mlp=args.num_layers_per_mlp,
                 dropout=args.dropout,
+                fourier_features=args.fourier_features,
                 **common_kwargs
             )
         elif args.model == 'from_dict':
