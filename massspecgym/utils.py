@@ -539,3 +539,165 @@ def get_ci(vals, confidence_level=0.999, n_resamples=20_000, seed=0):
     res = bootstrap((vals,), np.mean, confidence_level=confidence_level, n_resamples=n_resamples, random_state=seed)
     ci = res.confidence_interval
     return ci.low, ci.high
+
+
+# -----------------------------------------------------------------------------
+# Stereo stripping utilities
+#
+# Motivation: a model trained on MSG queries can trivially distinguish them
+# from S4-generated candidates because the S4 tokenizer (ChEMBL31, 38 tokens)
+# has no stereo tokens (`@`, `@@`, `/`, `\`) — all S4 candidates are stereo-
+# free by construction. The presence/absence of stereo markers becomes a
+# spectrum-free shortcut, exactly the failure mode the "Confronting spurious
+# evaluations..." paper warns against. To get a fair retrieval evaluation we
+# strip stereochemistry from both queries and candidates so the shortcut
+# disappears.
+# -----------------------------------------------------------------------------
+
+def strip_stereo(smi: str) -> T.Optional[str]:
+    """Return the canonical SMILES with stereochemistry removed, or ``None`` on parse failure.
+
+    Uses ``Chem.MolToSmiles(mol, canonical=True, isomericSmiles=False)``.
+
+    Args:
+        smi: input SMILES string.
+    """
+    if not isinstance(smi, str) or not smi:
+        return None
+    mol = Chem.MolFromSmiles(smi)
+    if mol is None:
+        return None
+    try:
+        return Chem.MolToSmiles(mol, canonical=True, isomericSmiles=False)
+    except Exception:
+        return None
+
+
+def _strip_stereo_parallel(smiles: T.Iterable[str], n_workers: int = 1) -> T.Dict[str, T.Optional[str]]:
+    """Internal helper: map ``{smi -> strip_stereo(smi)}`` over an iterable.
+
+    Uses ``multiprocessing.Pool`` (fork) when ``n_workers > 1``. Returns a dict.
+    """
+    items = list(smiles)
+    if n_workers <= 1:
+        return {s: strip_stereo(s) for s in items}
+    import multiprocessing as _mp
+
+    def _init():
+        from rdkit import RDLogger as _R
+        _R.DisableLog("rdApp.*")
+
+    ctx = _mp.get_context("fork")
+    with ctx.Pool(n_workers, initializer=_init) as pool:
+        results = pool.map(strip_stereo, items, chunksize=2000)
+    return dict(zip(items, results))
+
+
+def strip_stereo_tsv(
+    in_path: T.Union[str, Path],
+    out_path: T.Union[str, Path],
+    smiles_col: str = "smiles",
+    n_workers: int = 1,
+) -> int:
+    """Read TSV, strip stereo from ``smiles_col``, write out. Drops rows whose
+    SMILES failed to parse. Returns number of rows written.
+    """
+    in_path = Path(in_path)
+    out_path = Path(out_path)
+    df = pd.read_csv(in_path, sep="\t")
+    unique_smi = df[smiles_col].dropna().unique().tolist()
+    mapping = _strip_stereo_parallel(unique_smi, n_workers=n_workers)
+    df[smiles_col] = df[smiles_col].map(mapping)
+    n_before = len(df)
+    df = df[df[smiles_col].notna()].reset_index(drop=True)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(out_path, sep="\t", index=False)
+    return len(df)
+
+
+def strip_stereo_mgf(
+    in_path: T.Union[str, Path],
+    out_path: T.Union[str, Path],
+) -> int:
+    """Stream-rewrite an MGF: replace ``SMILES=...`` headers with the stereo-stripped
+    canonical SMILES. All other lines pass through unchanged. Returns number of
+    SMILES headers successfully rewritten (per-spectrum).
+    """
+    in_path = Path(in_path)
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    n_rewritten = 0
+    with in_path.open() as fin, out_path.open("w") as fout:
+        for line in fin:
+            if line.startswith("SMILES="):
+                smi = line[len("SMILES="):].strip()
+                new = strip_stereo(smi)
+                if new is not None:
+                    fout.write(f"SMILES={new}\n")
+                    n_rewritten += 1
+                else:
+                    fout.write(line)
+            else:
+                fout.write(line)
+    return n_rewritten
+
+
+def strip_stereo_candidates_json(
+    in_path: T.Union[str, Path],
+    out_path: T.Union[str, Path],
+    dedup: bool = True,
+    n_workers: int = 1,
+) -> T.Tuple[int, int]:
+    """Strip stereo from a retrieval-candidate JSON ``{query: [cands...]}`` and
+    write the result. Returns ``(n_keys_out, n_collisions_merged)``.
+
+    Behaviour:
+      - Query SMILES at index 0 of each list is preserved as the new key.
+      - Each candidate SMILES is stripped of stereo via :func:`strip_stereo`.
+      - When ``dedup=True`` (default), within-list duplicates after stripping
+        are removed (some former stereoisomer pairs collapse).
+      - If multiple original keys collapse to the same stripped SMILES, their
+        candidate lists are unioned with the first occurrence's order preserved.
+      - Candidates that fail to parse are dropped.
+    """
+    import json as _json
+    in_path = Path(in_path)
+    out_path = Path(out_path)
+    with in_path.open() as f:
+        d = _json.load(f)
+    smi_set: T.Set[str] = set(d.keys())
+    for v in d.values():
+        smi_set.update(v)
+    mapping = _strip_stereo_parallel(smi_set, n_workers=n_workers)
+
+    out: T.Dict[str, T.List[str]] = {}
+    n_collisions = 0
+    for q, cands in d.items():
+        q_strip = mapping.get(q)
+        if not q_strip:
+            continue
+        seen = {q_strip}
+        new_list: T.List[str] = [q_strip]
+        for c in cands:
+            cs = mapping.get(c)
+            if not cs:
+                continue
+            if dedup and cs in seen:
+                continue
+            new_list.append(cs)
+            if dedup:
+                seen.add(cs)
+        if q_strip in out:
+            n_collisions += 1
+            existing = set(out[q_strip])
+            for c in new_list[1:]:
+                if c not in existing and c != q_strip:
+                    out[q_strip].append(c)
+                    existing.add(c)
+        else:
+            out[q_strip] = new_list
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with out_path.open("w") as f:
+        _json.dump(out, f)
+    return len(out), n_collisions
