@@ -149,6 +149,10 @@ wandb/
 /data/*.xlsx
 /data/pubchem*
 /data/test_results*/
+# v1.5 release artefacts — distributed via Zenodo, not git
+/data/v1.5/*.tsv
+/data/v1.5/*.mgf
+/data/v1.5/*.json
 
 # Figures
 /figures/
