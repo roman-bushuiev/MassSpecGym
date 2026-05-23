@@ -55,18 +55,27 @@ echo "3) Molpher augment (after PubChem)"
 JID_MOL=$(sbatch --parsable --dependency=afterok:$JID_PC $EXP/submit_msg_s4_molpher.sh)
 echo "   $JID_MOL"
 
-echo "4) Build mol caches (after Molpher)"
-JID_CACHE=$(sbatch --parsable --dependency=afterok:$JID_MOL $EXP/submit_build_caches.sh)
+echo "4) Canonicalise candidate values in JSONs (after Molpher; blocking)"
+# Wait for Molpher to finish before running the canon-candidates step locally.
+# (~10 min on a login node with multiprocessing; no SLURM submission needed.)
+echo "   waiting for $JID_MOL ..."
+while squeue -h -j "$JID_MOL" 2>/dev/null | grep -q .; do sleep 30; done
+(cd $WS/MassSpecGym && python -u scripts/fixes/canonicalise_v15_candidate_values.py)
+echo "   v1.5 candidate JSONs canonicalised in place"
+
+echo "5) Build mol caches (after candidate canon)"
+JID_CACHE=$(sbatch --parsable $EXP/submit_build_caches.sh)
 echo "   $JID_CACHE"
 
 cat <<EOF
 
 submitted chain:
-  canon         (local, done synchronously before sbatch submissions)
-  emit          $JID_EMIT
-  pubchem_aug   $JID_PC     depends_on $JID_EMIT
-  molpher_aug   $JID_MOL    depends_on $JID_PC
-  build_caches  $JID_CACHE  depends_on $JID_MOL
+  canon            (local, done synchronously before sbatch submissions)
+  emit             $JID_EMIT
+  pubchem_aug      $JID_PC     depends_on $JID_EMIT
+  molpher_aug      $JID_MOL    depends_on $JID_PC
+  canon_candidates (local, ran synchronously after $JID_MOL completes)
+  build_caches     $JID_CACHE
 
 Monitor with: squeue -u \$USER
 

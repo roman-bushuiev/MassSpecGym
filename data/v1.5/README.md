@@ -13,9 +13,9 @@ that depends on `smiles`.
 | `MassSpecGym1.5_retrieval_candidates_formula.json` | Per-query formula-filtered retrieval candidates. 28,936 keys. Each value is a list of up to 512 candidate SMILES; the query SMILES is at index 0; all candidates share the query's molecular formula and have **distinct 2D-InChIKeys** from each other and from the query. Built by S4 (200M generations, MSG-train-only fine-tune) + PubChem v1.5 fallback + Molpher RerouteBond morphs (for remaining short formula queries). |
 | `MassSpecGym1.5_retrieval_candidates_mass.json` | Per-query mass-filtered (±10 ppm) retrieval candidates. 28,936 keys. Same structure; built by S4 + PubChem v1.5 fallback (no Molpher needed). |
 
-## Pipeline (canon → mine)
+## Pipeline (canon → mine → finalise)
 
-The published v1.5 build pipeline runs in two phases:
+The published v1.5 build pipeline runs in three phases:
 
 1. **Canonicalise + recompute** (TSV → MGF):
    `MassSpecGym/scripts/fixes/rdkit_canon_massspecgym.py` reads
@@ -25,9 +25,15 @@ The published v1.5 build pipeline runs in two phases:
    `MassSpecGym/scripts/build_msg_s4_pipeline.sh` chains the SLURM
    submit scripts under
    `experiments/data_builds/MassSpecGym_S4/` (emit → PubChem augment →
-   Molpher augment → bucket → emit), reading queries from
+   Molpher augment), reading queries from
    `data/v1.5/MassSpecGym1.5.tsv` and writing
    `data/v1.5/MassSpecGym1.5_retrieval_candidates_{formula,mass}.json`.
+3. **Canonicalise candidate values**:
+   `MassSpecGym/scripts/fixes/canonicalise_v15_candidate_values.py`
+   passes every candidate value through the same canonical+nostereo
+   transformation as the TSV / JSON keys, eliminating the small
+   fraction of Molpher-augmentation outputs with explicit-H notation.
+   Idempotent.
 
 ## Standardisation + recomputation
 
@@ -56,9 +62,12 @@ All other columns (`identifier`, `mzs`, `intensities`, `precursor_mz`,
 | Queries in `candidates_formula.json` | 28,936 |
 | Queries in `candidates_mass.json` | 28,936 |
 | TSV rows whose `smiles` is a JSON key | **231,104 / 231,104 (100 %)** |
-| Formula final — trivial (len=1) | 0 (0.000 %) |
-| Mass final — trivial (len=1) | 0 (0.000 %) |
-| Per-bucket 2D-InChIKey uniqueness (100 sampled buckets) | **0 duplicates** |
+| Mean candidates per formula bucket | 389.25 |
+| Mean candidates per mass bucket | 470.90 |
+| Buckets exceeding 512-cap | 0 |
+| Buckets with duplicate strings | 0 |
+| Query SMILES at index 0 of every bucket | ✓ |
+| Candidate values canonical (`MolToSmiles canonical=True, isomericSmiles=False`) | 99.99964 % (73 of 20,701,305 unique candidate strings flip between two equivalent forms under RDKit's own re-canonicalisation — pathological aromaticity edge cases, `canon(canon(s)) != canon(s)`. All parse to the correct molecule.) |
 
 ## Notebooks
 
