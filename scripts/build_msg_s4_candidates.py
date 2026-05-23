@@ -62,10 +62,13 @@ import pyarrow.parquet as pq
 # -----------------------------------------------------------------------------
 
 WORKSPACE = Path("/pfs/lustrep2/scratch/project_465002061/rbushuie/DreaMS-Mol_dev")
-DEFAULT_TSV = WORKSPACE / "MassSpecGym/data/MassSpecGym1.5.tsv"
+# Read the canon TSV produced by scripts/fixes/rdkit_canon_massspecgym.py
+# (stage 0 of the published pipeline). The candidate JSONs are then written
+# into the same data/v1.5/ directory.
+DEFAULT_TSV = WORKSPACE / "MassSpecGym/data/v1.5/MassSpecGym1.5.tsv"
 DEFAULT_OUT_DIR = WORKSPACE / "experiments/data_builds/MassSpecGym_S4"
-DEFAULT_FORMULA_JSON = WORKSPACE / "MassSpecGym/data/MassSpecGym_S4_retrieval_candidates_formula.json"
-DEFAULT_MASS_JSON = WORKSPACE / "MassSpecGym/data/MassSpecGym_S4_retrieval_candidates_mass.json"
+DEFAULT_FORMULA_JSON = WORKSPACE / "MassSpecGym/data/MassSpecGym_S4_retrieval_candidates_formula_nostereo.json"
+DEFAULT_MASS_JSON = WORKSPACE / "MassSpecGym/data/MassSpecGym_S4_retrieval_candidates_mass_nostereo.json"
 DEFAULT_PRETRAIN_CKPT = WORKSPACE / "experiments/data_builds/MERLIN_Apr2026/s4/ckpt_pretrain"
 DEFAULT_S4_REPO = WORKSPACE / "s4-for-de-novo-drug-design"
 
@@ -186,7 +189,13 @@ def _run_pool(items, n_workers, worker_fn):
 # -----------------------------------------------------------------------------
 
 def _stage_extract(args):
-    """Load MSG1.5 TSV, canonicalize unique queries by 2D-InChIKey across all folds."""
+    """Load MSG1.5 TSV, canonicalize-and-strip every unique raw SMILES, and emit
+    one row per **unique stripped canonical SMILES** (not per stored 2D-InChIKey).
+
+    Keying on the post-strip SMILES guarantees every distinct TSV query molecule
+    survives — earlier per-ik2d grouping silently dropped ~25 input ik2ds whose
+    RDKit-recomputed 2D-InChIKey collided with another's after canonicalization.
+    """
     out_path = args.out_dir / "extract_unique_mols.parquet"
     if out_path.exists() and not args.force:
         print(f"[extract] {out_path} exists; skipping")
@@ -196,31 +205,36 @@ def _stage_extract(args):
     df = pd.read_csv(args.input_tsv, sep="\t", usecols=["smiles", "inchikey", "fold"])
     print(f"[extract] {len(df):,} spectra rows; {df['smiles'].nunique():,} unique raw SMILES")
 
-    df["ik2d"] = df["inchikey"].str[:14]
-    # First-fold per ik2d (a mol may appear in only one fold per the disjointness check).
-    fold_per_ik = df.groupby("ik2d")["fold"].first()
-    # Lex-smallest SMILES per ik2d.
-    smi_per_ik = df.groupby("ik2d")["smiles"].min()
-    base = pd.DataFrame({"inchikey_2d": fold_per_ik.index, "smiles_raw": smi_per_ik.values, "fold": fold_per_ik.values})
-    print(f"[extract] {len(base):,} unique 2D-InChIKeys across all folds")
+    # First-fold per RAW SMILES (a mol may appear in only one fold per the disjointness check).
+    fold_per_raw = df.groupby("smiles")["fold"].first()
+    base = pd.DataFrame({"smiles_raw": fold_per_raw.index, "fold": fold_per_raw.values})
+    print(f"[extract] {len(base):,} unique raw SMILES across all folds")
 
-    items = list(zip(base["inchikey_2d"], base["smiles_raw"]))
-    print(f"[extract] canonicalizing with rdkit_canonical_smiles + computing formula/ik2d/mass ...")
+    items = list(zip(base["smiles_raw"], base["smiles_raw"]))
+    print(f"[extract] canonicalizing + stripping stereo + computing formula/ik2d/mass ...")
     t0 = time.perf_counter()
     results = _run_pool(items, args.n_workers, _worker_canon_full)
     print(f"[extract]   done in {time.perf_counter() - t0:.1f}s")
 
-    fold_lookup = dict(zip(base["inchikey_2d"], base["fold"]))
+    fold_lookup = dict(zip(base["smiles_raw"], base["fold"]))
     rows = []
-    for key, std, ik2d, formula, mass in results:
+    n_parse_fail = 0
+    for raw_smi, std, ik2d, formula, mass in results:
         if not (std and ik2d and formula and mass is not None):
+            n_parse_fail += 1
             continue
-        # Trust the ik2d from RDKit recompute on the canonical SMILES.
-        rows.append((ik2d, std, formula, mass, fold_lookup[key]))
+        # Strip stereo here so the emit stage's join key is the same form
+        # used in MassSpecGym1.5_nostereo.tsv.
+        from rdkit import Chem
+        m = Chem.MolFromSmiles(std)
+        smi_nostereo = Chem.MolToSmiles(m, canonical=True, isomericSmiles=False) if m else std
+        rows.append((ik2d, smi_nostereo, formula, mass, fold_lookup[raw_smi]))
     out_df = pd.DataFrame(rows, columns=["inchikey_2d", "smiles", "formula", "exact_mass", "fold"])
-    # Dedup by ik2d (RDKit recompute may collapse stereo variants).
-    out_df = out_df.drop_duplicates("inchikey_2d").reset_index(drop=True)
-    print(f"[extract] {len(out_df):,} unique mols after standardization")
+    print(f"[extract] {n_parse_fail:,} raw SMILES failed standardization (no formula/mass)")
+    # Dedup by the canonical+stripped SMILES (this is what emit will key on).
+    # Multiple raw SMILES that strip to the same nostereo form become one entry.
+    out_df = out_df.drop_duplicates("smiles", keep="first").reset_index(drop=True)
+    print(f"[extract] {len(out_df):,} unique canonical+stripped SMILES")
     print(f"[extract] fold counts:\n{out_df['fold'].value_counts().to_string()}")
     out_df.to_parquet(out_path, compression="zstd")
     print(f"[extract] -> {out_path}")
@@ -601,7 +615,7 @@ def _stage_bucket(args):
 # Stage: emit_formula_json + emit_mass_json
 # -----------------------------------------------------------------------------
 
-MAX_CANDIDATES = 1024
+MAX_CANDIDATES = 512
 PPM_MASS = 10  # ±10 ppm tolerance for mass-based buckets
 
 
@@ -611,20 +625,42 @@ def _trim_uniform(rng: random.Random, candidates: list[str], cap: int) -> list[s
     return rng.sample(candidates, cap)
 
 
+def _build_stereo_strip_map(unique_smiles: set[str], n_workers: int) -> dict[str, str | None]:
+    """Stereo-strip a set of SMILES in parallel. Returns ``{raw_smi -> stripped_or_None}``."""
+    from massspecgym.utils import _strip_stereo_parallel
+    print(f"[emit] stereo-stripping {len(unique_smiles):,} unique SMILES with {n_workers} workers ...")
+    t0 = time.perf_counter()
+    out = _strip_stereo_parallel(unique_smiles, n_workers=n_workers)
+    print(f"[emit] done in {time.perf_counter()-t0:.1f}s; "
+          f"failed={sum(1 for v in out.values() if not v):,}")
+    return out
+
+
 def _stage_emit_formula_json(args):
     queries = pd.read_parquet(args.out_dir / "extract_unique_mols.parquet")
     pool = pd.read_parquet(args.out_dir / "buckets.parquet")
     print(f"[emit_formula] queries={len(queries):,}  pool={len(pool):,}")
 
-    formula_to_smiles: dict[str, list[str]] = pool.groupby("formula")["smiles"].apply(list).to_dict()
-    print(f"[emit_formula] {len(formula_to_smiles):,} unique formulas in pool")
+    # Stereo-strip query + pool SMILES before forming candidate lists. 2D-InChIKey
+    # is stereo-invariant so the existing ik2d columns remain valid. Per-query
+    # dedup uses ik2d (not SMILES) so candidates with the same 2D structure as the
+    # query are excluded even if their canonical SMILES differs (e.g. tautomers).
+    smi2no = _build_stereo_strip_map(set(queries["smiles"]).union(pool["smiles"]), args.n_workers)
+    queries = queries.assign(smiles_no=queries["smiles"].map(smi2no)).dropna(subset=["smiles_no"]).reset_index(drop=True)
+    pool = pool.assign(smiles_no=pool["smiles"].map(smi2no)).dropna(subset=["smiles_no"]).reset_index(drop=True)
+    print(f"[emit_formula] post-strip — queries={len(queries):,}  pool={len(pool):,}")
+
+    formula_to_entries: dict[str, list[tuple[str, str]]] = {}
+    for row in pool[["formula", "smiles_no", "inchikey_2d"]].itertuples(index=False):
+        formula_to_entries.setdefault(row.formula, []).append((row.smiles_no, row.inchikey_2d))
+    print(f"[emit_formula] {len(formula_to_entries):,} unique formulas in pool")
 
     rng = random.Random(0)
     out: dict[str, list[str]] = {}
     sizes = []
     n_trivial = 0
-    for q_smi, q_formula in zip(queries["smiles"], queries["formula"]):
-        bucket = [c for c in formula_to_smiles.get(q_formula, []) if c != q_smi]
+    for q_smi, q_formula, q_ik in zip(queries["smiles_no"], queries["formula"], queries["inchikey_2d"]):
+        bucket = [smi for (smi, ik) in formula_to_entries.get(q_formula, []) if ik != q_ik]
         if bucket:
             cands = _trim_uniform(rng, bucket, MAX_CANDIDATES - 1)
             out[q_smi] = [q_smi] + cands
@@ -646,20 +682,27 @@ def _stage_emit_mass_json(args):
     pool = pd.read_parquet(args.out_dir / "buckets.parquet")
     print(f"[emit_mass] queries={len(queries):,}  pool={len(pool):,}")
 
-    # Sort pool by mass and binary-search per query.
+    smi2no = _build_stereo_strip_map(set(queries["smiles"]).union(pool["smiles"]), args.n_workers)
+    queries = queries.assign(smiles_no=queries["smiles"].map(smi2no)).dropna(subset=["smiles_no"]).reset_index(drop=True)
+    pool = pool.assign(smiles_no=pool["smiles"].map(smi2no)).dropna(subset=["smiles_no"]).reset_index(drop=True)
+    print(f"[emit_mass] post-strip — queries={len(queries):,}  pool={len(pool):,}")
+
     pool_sorted = pool.sort_values("exact_mass").reset_index(drop=True)
     masses = pool_sorted["exact_mass"].to_numpy()
-    smiles = pool_sorted["smiles"].to_numpy()
+    smiles_no = pool_sorted["smiles_no"].to_numpy()
+    iks = pool_sorted["inchikey_2d"].to_numpy()
 
     rng = random.Random(0)
     out: dict[str, list[str]] = {}
     sizes = []
     n_trivial = 0
-    for q_smi, q_mass in zip(queries["smiles"], queries["exact_mass"]):
+    for q_smi, q_mass, q_ik in zip(queries["smiles_no"], queries["exact_mass"], queries["inchikey_2d"]):
         tol = q_mass * PPM_MASS * 1e-6
         lo = np.searchsorted(masses, q_mass - tol, side="left")
         hi = np.searchsorted(masses, q_mass + tol, side="right")
-        bucket = [s for s in smiles[lo:hi].tolist() if s != q_smi]
+        slc_smi = smiles_no[lo:hi]
+        slc_ik = iks[lo:hi]
+        bucket = [slc_smi[i] for i in range(len(slc_smi)) if slc_ik[i] != q_ik]
         if bucket:
             cands = _trim_uniform(rng, bucket, MAX_CANDIDATES - 1)
             out[q_smi] = [q_smi] + cands
