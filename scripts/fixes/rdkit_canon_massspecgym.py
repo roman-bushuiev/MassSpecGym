@@ -1,30 +1,59 @@
-"""Canonicalize all SMILES in MassSpecGym with RDKit (v1.5 release).
+"""Canonicalise MassSpecGym SMILES + recompute all SMILES-derived columns.
 
-Produces:
-  - MassSpecGym1.5.tsv  (smiles column canonicalized)
-  - MassSpecGym1.5.mgf  (MGF export of the above)
-  - MassSpecGym1.5_retrieval_candidates_formula.json
-  - MassSpecGym1.5_retrieval_candidates_mass.json
+This is the first step of the published v1.5 build pipeline:
 
-All SMILES (TSV column, JSON keys, and ALL JSON candidate values) are
-canonicalized with massspecgym.utils.rdkit_canonical_smiles.
+    1. rdkit_canon_massspecgym.py     ← canonicalise + recompute derived cols
+    2. mine retrieval candidates      ← S4 build pipeline (separate)
+
+Reads:
+  - MassSpecGym/data/MassSpecGym.tsv   (PubChem-standardised release)
+
+Writes:
+  - MassSpecGym/data/v1.5/MassSpecGym1.5.tsv
+  - MassSpecGym/data/v1.5/MassSpecGym1.5.mgf
+
+For every row:
+  - smiles              ← RDKit canonical, stereo-stripped
+                           (massspecgym.utils.rdkit_canonical_smiles)
+  - formula             ← rdMolDescriptors.CalcMolFormula(mol)
+  - inchikey            ← first 14 chars of MolToInchiKey(MolToInchi(mol))
+                           (the 2D-InChIKey convention used in v1)
+  - parent_mass         ← rdMolDescriptors.CalcExactMolWt(mol)
+  - precursor_formula   ← Hill-notation formula of (n_parents * formula
+                           +/- adduct ion components), via matchms
+                           adduct parsing
+
+Columns NOT recomputed (passed through unchanged):
+  - identifier, mzs, intensities         (measurement / identity)
+  - precursor_mz                          (measured m/z, not derived)
+  - adduct, instrument_type,
+    collision_energy, fold,
+    simulation_challenge                  (annotation / metadata)
+
+Logs per-column change counts (rows where the recomputed value differs
+from the value carried over from the input TSV).
 """
 
-import json
+from __future__ import annotations
+
 import logging
-import random
+import os
+import re
 import sys
 from collections import Counter
 from pathlib import Path
-import os
 
 import numpy as np
 import pandas as pd
 from matchms import Spectrum
 from matchms.exporting import save_as_mgf
+from matchms.filtering.filter_utils.interpret_unknown_adduct import (
+    get_ions_from_adduct,
+    split_ion,
+)
 from rdkit import Chem, RDLogger
 from rdkit.Chem import rdMolDescriptors
-from rdkit.Chem.inchi import MolToInchi, InchiToInchiKey
+from rdkit.Chem.inchi import InchiToInchiKey, MolToInchi
 from tqdm import tqdm
 
 import massspecgym.utils as utils
@@ -33,16 +62,9 @@ RDLogger.logger().setLevel(RDLogger.CRITICAL)
 
 BASE = Path("/scratch/project_465002061/rbushuie/DreaMS-Mol_dev")
 TSV_IN = BASE / "MassSpecGym/data/MassSpecGym.tsv"
-TSV_OUT = BASE / "MassSpecGym/data/MassSpecGym1.5.tsv"
-MGF_OUT = BASE / "MassSpecGym/data/MassSpecGym1.5.mgf"
-
-CAND_JSONS = [
-    BASE / "MassSpecGym/data/MassSpecGym_retrieval_candidates_formula.json",
-    BASE / "MassSpecGym/data/MassSpecGym_retrieval_candidates_mass.json",
-]
-JSON_OUT_DIR = BASE / "MassSpecGym/data"
-
-JSON_SANITY_SAMPLE = 2000  # random keys+first-cands probed before re-canonicalization
+OUT_DIR = BASE / "MassSpecGym/data/v1.5"
+TSV_OUT = OUT_DIR / "MassSpecGym1.5.tsv"
+MGF_OUT = OUT_DIR / "MassSpecGym1.5.mgf"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -52,213 +74,232 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
-canon_counts = Counter()  # "canonical_true", "canonical_fallback", "kept_original"
+# ─── Formula arithmetic (verbatim from notebooks/dataset_construction/2_clean_library.ipynb)
+class Formula:
+    def __init__(self, formula: str):
+        self.dict_representation = self.get_atom_and_counts(formula)
+
+    @staticmethod
+    def get_atom_and_counts(formula: str) -> dict[str, int]:
+        parts = re.findall(r"[A-Z][a-z]?|[0-9]+", formula)
+        out: dict[str, int] = {}
+        for i, atom in enumerate(parts):
+            if atom.isnumeric():
+                continue
+            mult = int(parts[i + 1]) if len(parts) > i + 1 and parts[i + 1].isnumeric() else 1
+            out[atom] = out.get(atom, 0) + mult
+        return out
+
+    def __add__(self, other: "Formula") -> "Formula":
+        new = Formula("")
+        new.dict_representation = self.dict_representation.copy()
+        for a, v in other.dict_representation.items():
+            new.dict_representation[a] = new.dict_representation.get(a, 0) + v
+        return new
+
+    def __sub__(self, other: "Formula") -> "Formula | None":
+        new = Formula("")
+        new.dict_representation = self.dict_representation.copy()
+        for a, v in other.dict_representation.items():
+            if a not in new.dict_representation:
+                return None
+            new.dict_representation[a] -= v
+            if new.dict_representation[a] < 0:
+                return None
+        return new
+
+    def __str__(self) -> str:
+        d = self.dict_representation
+        c = d.get("C", 0); h = d.get("H", 0)
+        rest = sorted((k, v) for k, v in d.items() if k not in ("C", "H"))
+        out = ""
+        if c > 0:
+            out += "C" + (str(c) if c > 1 else "")
+        if h > 0:
+            out += "H" + (str(h) if h > 1 else "")
+        for k, v in rest:
+            out += k + (str(v) if v > 1 else "")
+        return out
+
+
+def precursor_formula_from(formula: str, adduct: str) -> str | None:
+    """Replicates notebooks/dataset_construction/2_clean_library.ipynb::add_precursor_formula
+    (kept byte-identical for v1.5)."""
+    try:
+        n_parents, ions = get_ions_from_adduct(adduct)
+    except Exception:
+        return None
+    if formula is None:
+        return None
+    parent = Formula(formula)
+    out = Formula("")
+    for _ in range(n_parents):
+        out = out + parent
+    for ion in ions:
+        sign, number, ion_formula = split_ion(ion)
+        for _ in range(number):
+            if sign == "+":
+                out = out + Formula(ion_formula)
+            elif sign == "-":
+                tmp = out - Formula(ion_formula)
+                if tmp is None:
+                    return None
+                out = tmp
+    return str(out)
+
+
+canon_counts: Counter = Counter()
 
 
 def rdkit_canonical(smi: str) -> str:
-    result, outcome = utils.rdkit_canonical_smiles(smi, return_outcome=True)
-    canon_counts[outcome] += 1
-    return result
+    """RDKit canonical SMILES, stereo stripped (v1.5 convention).
+
+    Equivalent to ``Chem.MolToSmiles(mol, canonical=True, isomericSmiles=False)``,
+    with the same outcome-bookkeeping fallback as ``utils.rdkit_canonical_smiles``.
+    The stereo strip is what makes the SMILES join key match the
+    candidate JSON keys (which are built stereo-stripped).
+    """
+    mol = Chem.MolFromSmiles(smi)
+    if mol is None:
+        canon_counts["kept_original"] += 1
+        return smi
+    try:
+        result = Chem.MolToSmiles(mol, canonical=True, isomericSmiles=False)
+        canon_counts["canonical_true"] += 1
+        return result
+    except Exception:
+        try:
+            result = Chem.MolToSmiles(mol, isomericSmiles=False)
+            canon_counts["canonical_fallback"] += 1
+            return result
+        except Exception:
+            canon_counts["kept_original"] += 1
+            return smi
 
 
-def main():
-    # ── 1. Collect ALL unique SMILES from TSV + JSONs ────────────────────
+def main() -> None:
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
     log.info("Reading %s ...", TSV_IN)
     df = pd.read_csv(TSV_IN, sep="\t")
-    log.info("Loaded %d rows", len(df))
+    log.info("Loaded %d rows × %d cols: %s", len(df), df.shape[1], list(df.columns))
 
-    all_smiles: set[str] = set(df["smiles"].unique())
-    log.info("Unique SMILES in TSV: %d", len(all_smiles))
+    # ── 1. Canonicalise SMILES ────────────────────────────────────────────
+    unique_smiles = sorted(df["smiles"].unique())
+    log.info("Canonicalising %d unique SMILES ...", len(unique_smiles))
+    canon_map = {s: rdkit_canonical(s) for s in tqdm(unique_smiles, desc="Canon SMILES")}
+    n_unique_changed = sum(1 for k, v in canon_map.items() if k != v)
+    log.info("  MolToSmiles(canonical=True):     %d", canon_counts["canonical_true"])
+    log.info("  MolToSmiles() fallback:          %d", canon_counts["canonical_fallback"])
+    log.info("  Kept original SMILES:            %d", canon_counts["kept_original"])
+    log.info("  Unique SMILES that changed:      %d / %d", n_unique_changed, len(unique_smiles))
 
-    json_data: dict[Path, dict[str, list[str]]] = {}
-    for json_path in CAND_JSONS:
-        log.info("Reading %s ...", json_path)
-        with open(json_path) as f:
-            cands: dict[str, list[str]] = json.load(f)
-        json_data[json_path] = cands
-        for key, vals in cands.items():
-            all_smiles.add(key)
-            all_smiles.update(vals)
-        log.info("  %d keys loaded", len(cands))
-
-    log.info("Total unique SMILES across TSV + all JSONs: %d", len(all_smiles))
-
-    # ── 1b. JSON canonicality sanity check ───────────────────────────────
-    # Documentation step: we ALWAYS proceed to full re-canonicalization in step 2.
-    # This block just empirically reports how much of each input JSON would change,
-    # so a reader can confirm that re-canonicalizing the JSONs is (or isn't) necessary.
-    log.info("--- JSON canonicality sanity check ---")
-    rng = random.Random(0)
-    for json_path, cands in json_data.items():
-        keys = list(cands.keys())
-        n_sample = min(JSON_SANITY_SAMPLE, len(keys))
-        sample_keys = rng.sample(keys, n_sample)
-        n_keys_changed = 0
-        n_vals_total = 0
-        n_vals_changed = 0
-        for k in sample_keys:
-            kc = utils.rdkit_canonical_smiles(k)
-            if kc != k:
-                n_keys_changed += 1
-            vals = cands[k]
-            if vals:
-                v = vals[0]
-                vc = utils.rdkit_canonical_smiles(v)
-                n_vals_total += 1
-                if vc != v:
-                    n_vals_changed += 1
-        log.info(
-            "  %s: %d/%d keys (%.2f%%) and %d/%d first-candidates (%.2f%%) "
-            "would change under re-canonicalization.",
-            json_path.name,
-            n_keys_changed, n_sample,
-            100.0 * n_keys_changed / max(1, n_sample),
-            n_vals_changed, n_vals_total,
-            100.0 * n_vals_changed / max(1, n_vals_total),
-        )
-
-    # ── 2. Build global canonical mapping ────────────────────────────────
-    log.info("Canonicalizing %d unique SMILES ...", len(all_smiles))
-    canon_map: dict[str, str] = {}
-    for i, smi in enumerate(sorted(all_smiles)):
-        if i % 500_000 == 0 and i > 0:
-            log.info("  Canonicalization progress: %d / %d", i, len(all_smiles))
-        canon_map[smi] = rdkit_canonical(smi)
-    n_changed = sum(1 for k, v in canon_map.items() if k != v)
-    log.info("--- Canonicalization summary ---")
-    log.info("  Total unique SMILES: %d", len(canon_map))
-    log.info("  MolToSmiles(canonical=True): %d", canon_counts["canonical_true"])
-    log.info("  MolToSmiles() fallback:      %d", canon_counts["canonical_fallback"])
-    log.info("  Kept original SMILES:        %d", canon_counts["kept_original"])
-    log.info("  SMILES that changed:         %d", n_changed)
-
-    # ── 3. Replace SMILES in TSV and validate properties ─────────────────
-    orig_smiles_col = df["smiles"].copy()
+    orig_cols = df[["smiles", "formula", "inchikey", "parent_mass", "precursor_formula"]].copy()
     df["smiles"] = df["smiles"].map(canon_map)
 
-    log.info("Validating formula, parent_mass, inchikey against canonical SMILES ...")
-    error_counts: Counter = Counter()
-    validation_errors: list[str] = []
-    MASS_TOL = 0.1
+    # ── 2. Recompute SMILES-derived columns row-by-row ────────────────────
+    new_formula: list[str | None] = [None] * len(df)
+    new_inchikey: list[str | None] = [None] * len(df)
+    new_parent_mass: list[float | None] = [None] * len(df)
+    new_precursor_formula: list[str | None] = [None] * len(df)
+    err_counts: Counter = Counter()
 
-    for idx, row in tqdm(df.iterrows(), total=len(df), desc="Validating"):
-        new_smi = row["smiles"]
-        orig_smi = orig_smiles_col.iloc[idx] if hasattr(orig_smiles_col, "iloc") else orig_smiles_col[idx]
-        mol = Chem.MolFromSmiles(new_smi)
+    for idx, row in tqdm(df.iterrows(), total=len(df), desc="Recompute"):
+        smi = row["smiles"]
+        mol = Chem.MolFromSmiles(smi) if isinstance(smi, str) else None
         if mol is None:
-            error_counts["parse_failed"] += 1
-            validation_errors.append(
-                f"[parse_failed] Row {idx}: cannot parse new_smi='{new_smi}' orig_smi='{orig_smi}'")
+            err_counts["parse_failed"] += 1
+            new_formula[idx] = row["formula"]
+            new_inchikey[idx] = row["inchikey"]
+            new_parent_mass[idx] = row["parent_mass"]
+            new_precursor_formula[idx] = row["precursor_formula"]
             continue
 
-        computed_formula = rdMolDescriptors.CalcMolFormula(mol)
-        computed_mass = rdMolDescriptors.CalcExactMolWt(mol)
+        f = rdMolDescriptors.CalcMolFormula(mol)
+        m = float(rdMolDescriptors.CalcExactMolWt(mol))
         inchi = MolToInchi(mol)
-        computed_ik = InchiToInchiKey(inchi)[:14] if inchi else None
+        ik = InchiToInchiKey(inchi)[:14] if inchi else None
+        if ik is None:
+            err_counts["inchikey_compute_failed"] += 1
+        pf = precursor_formula_from(f, row["adduct"])
+        if pf is None:
+            err_counts["precursor_formula_compute_failed"] += 1
+            pf = row["precursor_formula"]
 
-        orig_formula = str(row["formula"])
-        orig_mass = float(row["parent_mass"])
-        orig_ik = str(row["inchikey"])[:14]
+        new_formula[idx] = f
+        new_inchikey[idx] = ik if ik is not None else row["inchikey"]
+        new_parent_mass[idx] = m
+        new_precursor_formula[idx] = pf
 
-        if computed_formula != orig_formula:
-            error_counts["formula_mismatch"] += 1
-            validation_errors.append(
-                f"[formula_mismatch] Row {idx}: stored='{orig_formula}' computed='{computed_formula}' "
-                f"orig_smi='{orig_smi}' new_smi='{new_smi}'")
+    df["formula"] = new_formula
+    df["inchikey"] = new_inchikey
+    df["parent_mass"] = new_parent_mass
+    df["precursor_formula"] = new_precursor_formula
 
-        if abs(computed_mass - orig_mass) >= MASS_TOL:
-            error_counts["mass_mismatch"] += 1
-            validation_errors.append(
-                f"[mass_mismatch] Row {idx}: stored={orig_mass} computed={computed_mass} "
-                f"orig_smi='{orig_smi}' new_smi='{new_smi}'")
+    # ── 3. Per-column change report ───────────────────────────────────────
+    log.info("--- Per-column change counts vs input TSV ---")
+    MASS_TOL = 1e-3
+    n_total = len(df)
 
-        if computed_ik != orig_ik:
-            error_counts["inchikey_mismatch"] += 1
-            validation_errors.append(
-                f"[inchikey_mismatch] Row {idx}: stored='{orig_ik}' computed='{computed_ik}' "
-                f"orig_smi='{orig_smi}' new_smi='{new_smi}'")
+    def _str_diff(a: pd.Series, b: pd.Series) -> int:
+        sa = a.astype(object).where(a.notna(), "<NA>").astype(str)
+        sb = b.astype(object).where(b.notna(), "<NA>").astype(str)
+        return int((sa != sb).sum())
 
-    log.info("--- Property validation summary ---")
-    log.info("  Total rows: %d", len(df))
-    if error_counts:
-        for err_type, cnt in error_counts.most_common():
-            log.info("  %s: %d", err_type, cnt)
-        log.info("  All validation errors:")
-        for err in validation_errors:
-            log.info("    %s", err)
+    n_smiles_diff = _str_diff(orig_cols["smiles"], df["smiles"])
+    n_formula_diff = _str_diff(orig_cols["formula"], df["formula"])
+    n_inchikey_diff = _str_diff(orig_cols["inchikey"], df["inchikey"])
+    n_precursor_formula_diff = _str_diff(orig_cols["precursor_formula"], df["precursor_formula"])
+    diff_mass = (~np.isclose(
+        orig_cols["parent_mass"].astype(float).fillna(-1e30),
+        df["parent_mass"].astype(float).fillna(-1e30),
+        atol=MASS_TOL, rtol=0,
+    ))
+    n_parent_mass_diff = int(diff_mass.sum())
+
+    for name, n in [
+        ("smiles", n_smiles_diff),
+        ("formula", n_formula_diff),
+        ("inchikey", n_inchikey_diff),
+        ("parent_mass", n_parent_mass_diff),
+        ("precursor_formula", n_precursor_formula_diff),
+    ]:
+        log.info("  %-18s %7d / %d  (%.3f %%)", name, n, n_total, 100 * n / n_total)
+
+    if err_counts:
+        log.info("--- Per-row computation errors ---")
+        for k, v in err_counts.most_common():
+            log.info("  %-30s %d", k, v)
     else:
-        log.info("  All properties match — canonicalization is safe.")
+        log.info("  No row-level computation errors.")
 
+    # ── 4. Write TSV ──────────────────────────────────────────────────────
     log.info("Writing %s ...", TSV_OUT)
     df.to_csv(TSV_OUT, sep="\t", index=False)
 
-    # ── 4. Convert to MGF ────────────────────────────────────────────────
-    log.info("Converting to MGF ...")
-    spectra = []
-    for _, row in tqdm(df.iterrows(), total=len(df), desc="Building spectra"):
+    # ── 5. Write MGF (one-pass conversion from the TSV we just wrote) ─────
+    log.info("Building MGF from %s ...", TSV_OUT)
+    spectra: list[Spectrum] = []
+    for _, row in tqdm(df.iterrows(), total=len(df), desc="Build spectra"):
         metadata = {
             k: v for k, v in row.items()
             if k not in ("mzs", "intensities") and v is not np.nan
         }
-        spec = Spectrum(
+        spectra.append(Spectrum(
             mz=utils.parse_spec_array(row["mzs"]),
             intensities=utils.parse_spec_array(row["intensities"]),
             metadata=metadata,
-        )
-        spectra.append(spec)
-    # Delete previous MGF if it exists
+        ))
     if MGF_OUT.exists():
-        log.info("Previous MGF file exists. Deleting %s", MGF_OUT)
+        log.info("  Removing existing %s", MGF_OUT)
         os.remove(MGF_OUT)
     log.info("Writing %s (%d spectra) ...", MGF_OUT, len(spectra))
     save_as_mgf(spectra, str(MGF_OUT))
 
-    # ── 5. Process candidate JSONs ───────────────────────────────────────
-    for json_in_path, cands in json_data.items():
-        log.info("=" * 60)
-        log.info("Processing %s ...", json_in_path)
-
-        first_eq_key = 0
-        first_ne_key = 0
-        first_ne_key_examples: list[str] = []
-
-        new_cands: dict[str, list[str]] = {}
-        for key, vals in cands.items():
-            new_key = canon_map[key]
-
-            if vals and vals[0] == key:
-                first_eq_key += 1
-            else:
-                first_ne_key += 1
-                first_ne_key_examples.append(
-                    f"key='{key}' first='{vals[0] if vals else '<empty>'}'")
-
-            new_vals = [canon_map[v] for v in vals]
-            new_cands[new_key] = new_vals
-
-        stem = json_in_path.stem.replace("MassSpecGym_retrieval_candidates_", "")
-        stem_tag = stem.split("_")[0]
-        json_out_path = JSON_OUT_DIR / f"MassSpecGym1.5_retrieval_candidates_{stem_tag}.json"
-
-        log.info("Writing %s ...", json_out_path)
-        with open(json_out_path, "w") as f:
-            json.dump(new_cands, f)
-
-        log.info("--- JSON summary for %s ---", stem_tag)
-        log.info("  Total keys: %d", len(cands))
-        log.info("  First element == key (expected): %d", first_eq_key)
-        log.info("  First element != key (UNEXPECTED): %d", first_ne_key)
-        if first_ne_key_examples:
-            for ex in first_ne_key_examples:
-                log.info("    %s", ex)
-
-    # ── 6. Final summary ─────────────────────────────────────────────────
     log.info("=" * 60)
-    log.info("ALL DONE")
+    log.info("DONE.")
+    log.info("  TSV: %s", TSV_OUT)
+    log.info("  MGF: %s", MGF_OUT)
     log.info("=" * 60)
-    log.info("TSV: %s", TSV_OUT)
-    log.info("MGF: %s", MGF_OUT)
-    log.info("Candidate JSONs written to: %s", JSON_OUT_DIR)
 
 
 if __name__ == "__main__":
