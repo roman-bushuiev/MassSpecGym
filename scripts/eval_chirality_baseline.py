@@ -69,16 +69,36 @@ def fit_direction(tsv: pd.DataFrame, cands: dict[str, list[str]], chir_cache: di
     return direction
 
 
-def hit_at_k(scores: np.ndarray, gt_idx: int, k: int, rng: np.random.Generator) -> int:
-    """Hit-rate@k with random tie-breaking.
+def hit_at_k_and_mrr_averaged(scores: np.ndarray, gt_idx: int, ks: tuple[int, ...],
+                                rng: np.random.Generator, n_tie_breaks: int = 100,
+                                ) -> tuple[tuple[float, ...], float]:
+    """Return ((hit@k1, hit@k2, ...), mrr) averaged over ``n_tie_breaks``
+    independent random tie-break orderings.
 
-    Stable np.argsort + GT-always-at-index-0 would give a spurious 100% hit@k
-    whenever scores are tied (e.g. all zero after stereo-stripping). Add a
-    tiny per-row random jitter to break ties uniformly.
+    Stable ``np.argsort`` + GT always at index 0 would give 100% hit@k when
+    scores are all tied. A single random jitter realization fixes the
+    spurious 100% but is itself a high-variance single draw (with most
+    chirality counts being 0 after stereo-stripping, almost all candidates
+    are tied — the result depends almost entirely on the jitter). Averaging
+    over many tie-break realizations matches the random baseline's stability
+    and gives the *expected* hit@k / MRR under uniform tie-breaking.
     """
-    jitter = rng.random(len(scores)) * 1e-9
-    order = np.argsort(-(scores + jitter), kind="stable")
-    return int(np.where(order == gt_idx)[0][0] < k)
+    # (n_tie_breaks, len(scores))
+    jitters = rng.random((n_tie_breaks, len(scores))) * 1e-9
+    # Order indices per realization.
+    orders = np.argsort(-(scores[None, :] + jitters), axis=1, kind="stable")
+    # GT's rank (1-indexed) per realization.
+    gt_ranks = (orders == gt_idx).argmax(axis=1) + 1
+    hits = tuple(float((gt_ranks <= k).mean()) for k in ks)
+    mrr = float((1.0 / gt_ranks).mean())
+    return hits, mrr
+
+
+def hit_at_k_averaged(scores: np.ndarray, gt_idx: int, ks: tuple[int, ...],
+                       rng: np.random.Generator, n_tie_breaks: int = 100) -> tuple[float, ...]:
+    """Back-compat wrapper. Prefer ``hit_at_k_and_mrr_averaged``."""
+    hits, _ = hit_at_k_and_mrr_averaged(scores, gt_idx, ks, rng, n_tie_breaks)
+    return hits
 
 
 def main():
@@ -132,15 +152,18 @@ def main():
             continue
         s_arr = np.asarray([chir_cache.get(c, 0) for c in cand_list], dtype=np.float32) * (-sign)
         gt_idx = 0
+        (h1, h5, h20), mrr = hit_at_k_and_mrr_averaged(
+            s_arr, gt_idx, (1, 5, 20), rng, n_tie_breaks=100)
         rows.append({
             "smiles": q,
             "n_cands": len(cand_list),
-            "hit_rate@1":  hit_at_k(s_arr, gt_idx, 1, rng),
-            "hit_rate@5":  hit_at_k(s_arr, gt_idx, 5, rng),
-            "hit_rate@20": hit_at_k(s_arr, gt_idx, 20, rng),
+            "hit_rate@1":  h1,
+            "hit_rate@5":  h5,
+            "hit_rate@20": h20,
+            "mrr":         mrr,
             "chir_count_gt": int(chir_cache.get(q, 0)),
         })
-        if (i + 1) % 5000 == 0:
+        if (i + 1) % 1000 == 0:
             print(f"  {i + 1}/{len(target_smiles)} processed in {time.perf_counter()-t0:.1f}s")
 
     df = pd.DataFrame(rows)
@@ -148,6 +171,7 @@ def main():
     print(f"hit_rate@1  = {df['hit_rate@1'].mean()*100:.2f}%")
     print(f"hit_rate@5  = {df['hit_rate@5'].mean()*100:.2f}%")
     print(f"hit_rate@20 = {df['hit_rate@20'].mean()*100:.2f}%")
+    print(f"mrr         = {df['mrr'].mean()*100:.2f}%")
     print(f"direction: {direction}")
     print(f"n queries: {len(df):,}")
 
