@@ -30,13 +30,26 @@ RDLogger.DisableLog("rdApp.*")
 
 
 def chir_count(smi: str) -> int:
+    """Count *potential* stereocenters from the 2D connectivity.
+
+    The v1.5 release strips all explicit stereochemistry from SMILES, so
+    counting annotated chiral atoms (``GetChiralTag() != CHI_UNSPECIFIED``)
+    gives 0 for every molecule and the baseline collapses to ties only.
+    ``Chem.FindMolChiralCenters(includeUnassigned=True)`` instead returns
+    every atom that *could* be a stereocenter based on its 2D environment
+    (four different graph neighbours), regardless of whether it carries an
+    R/S annotation. After stereo-strip this is the right notion of
+    "chirality count" — it reflects the molecule's intrinsic 3D
+    flexibility, not the SMILES author's choices.
+    """
     m = Chem.MolFromSmiles(smi)
     if m is None:
         return 0
-    return sum(
-        1 for a in m.GetAtoms()
-        if a.GetChiralTag() != Chem.ChiralType.CHI_UNSPECIFIED
-    )
+    try:
+        return len(Chem.FindMolChiralCenters(
+            m, includeUnassigned=True, useLegacyImplementation=False))
+    except Exception:
+        return 0
 
 
 def _precompute_chir_counts(unique_smiles: list[str], n_workers: int) -> dict[str, int]:

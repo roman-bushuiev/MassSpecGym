@@ -90,6 +90,15 @@ def main() -> None:
             })
         df_random = pd.DataFrame(rows)
         path = OUT / f"random_{variant}_nostereo.pkl"
+        # Preserve test_mces@1 if already computed by scripts/add_mces_at_1.py.
+        if path.exists():
+            try:
+                prev = pd.read_pickle(path)
+                if "test_mces@1" in prev.columns:
+                    df_random = df_random.merge(
+                        prev[["identifier", "test_mces@1"]], on="identifier", how="left")
+            except Exception:
+                pass
         with path.open("wb") as f: pickle.dump(df_random, f)
         print(f"  random:    wrote {path.name}  (hit@1 = {df_random['test_hit_rate@1'].mean()*100:.3f}%, sampled per SMILES then expanded)")
 
@@ -114,6 +123,15 @@ def main() -> None:
             })
         df_chir = pd.DataFrame(rows)
         path = OUT / f"chirality_{variant}_nostereo_per_spectrum.pkl"
+        # Preserve test_mces@1 if already computed by scripts/add_mces_at_1.py.
+        if path.exists():
+            try:
+                prev = pd.read_pickle(path)
+                if "test_mces@1" in prev.columns:
+                    df_chir = df_chir.merge(
+                        prev[["identifier", "test_mces@1"]], on="identifier", how="left")
+            except Exception:
+                pass
         with path.open("wb") as f: pickle.dump(df_chir, f)
         print(f"  chirality: wrote {path.name}  (hit@1 = {df_chir['test_hit_rate@1'].mean()*100:.3f}%)")
 
