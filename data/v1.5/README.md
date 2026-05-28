@@ -1,90 +1,85 @@
-# MassSpecGym v1.5 — final release files
+# MassSpecGym v1.5 — MSG-4M-pretrained release
 
-Stereo-stripped, 2D-InChIKey-unique S4 retrieval candidates aligned with
-canonicalised spectrum data, plus recomputed values for every column
-that depends on `smiles`.
+This release uses an S4 candidate generator pretrained on a
+**MassSpecGym-aligned 4M-molecule corpus** (`MassSpecGym_molecules_MCES2_disjoint_with_valtest_4M`)
+rather than the ChEMBL31 corpus used in `data/v1.5_ChEMBL/`. The motivation,
+build, and headline outcome are documented in the
+`notebooks/massspecgym_in_the_wild/` folder.
 
 ## Files
 
 | File | Description |
 |---|---|
-| `MassSpecGym1.5.tsv` | 231,104 spectra × 14 metadata columns. `smiles` column is RDKit canonical + stereo-stripped (`MolToSmiles(canonical=True, isomericSmiles=False)`). Every row's `smiles` is a key in both candidate JSONs (100% coverage). **TSV is the canonical source of truth** — see `MassSpecGym1.5.mgf` below. |
-| `MassSpecGym1.5.mgf` | Same 231,104 spectra in MGF format. **Derived from `MassSpecGym1.5.tsv` in a single pass** via `matchms.exporting.save_as_mgf` inside the same canon script (`MassSpecGym/scripts/fixes/rdkit_canon_massspecgym.py`). The two files therefore carry identical content. |
-| `MassSpecGym1.5_retrieval_candidates_formula.json` | Per-query formula-filtered retrieval candidates. 28,936 keys. Each value is a list of up to 512 candidate SMILES; the query SMILES is at index 0; all candidates share the query's molecular formula and have **distinct 2D-InChIKeys** from each other and from the query. Built by S4 (200M generations, MSG-train-only fine-tune) + PubChem v1.5 fallback + Molpher RerouteBond morphs (for remaining short formula queries). |
-| `MassSpecGym1.5_retrieval_candidates_mass.json` | Per-query mass-filtered (±10 ppm) retrieval candidates. 28,936 keys. Same structure; built by S4 + PubChem v1.5 fallback (no Molpher needed). |
+| `MassSpecGym1.5.tsv` | 231,104 spectra × 14 metadata columns. Identical to v1.5_ChEMBL/MassSpecGym1.5.tsv — spectrum data does not depend on the generator. |
+| `MassSpecGym1.5.mgf` | Same spectra in MGF format, identical to v1.5_ChEMBL/. |
+| `MassSpecGym1.5_retrieval_candidates_formula.json` | Per-query 512-cap formula-filtered candidates produced by the MSG-4M S4 + PubChem fallback + Molpher augmentation, canonicalised values. |
+| `MassSpecGym1.5_retrieval_candidates_mass.json` | Per-query 512-cap mass-filtered (±10 ppm) candidates from MSG-4M S4 + PubChem fallback. |
 
-## Pipeline (canon → mine → finalise)
+## Why a new pretrain corpus?
 
-The published v1.5 build pipeline runs in three phases:
+The ChEMBL release (`v1.5_ChEMBL/`) had a chir-distribution mismatch
+with MSG GT: S4 candidates clustered at chir = 0 (drug-like, fully
+aromatic), while MSG GT has median chir = 1. A 1-line RDKit baseline
+(count potential stereocenters via `FindMolChiralCenters(includeUnassigned=True)`)
+exploited this gap and reached **5× random hit@1 on mass** — a
+benchmark artifact, not a real signal.
 
-1. **Canonicalise + recompute** (TSV → MGF):
-   `MassSpecGym/scripts/fixes/rdkit_canon_massspecgym.py` reads
-   `MassSpecGym/data/MassSpecGym.tsv`, writes
-   `data/v1.5/MassSpecGym1.5.{tsv,mgf}`.
-2. **Mine retrieval candidates** (TSV → JSONs):
-   `MassSpecGym/scripts/build_msg_s4_pipeline.sh` chains the SLURM
-   submit scripts under
-   `experiments/data_builds/MassSpecGym_S4/` (emit → PubChem augment →
-   Molpher augment), reading queries from
-   `data/v1.5/MassSpecGym1.5.tsv` and writing
-   `data/v1.5/MassSpecGym1.5_retrieval_candidates_{formula,mass}.json`.
-3. **Canonicalise candidate values**:
-   `MassSpecGym/scripts/fixes/canonicalise_v15_candidate_values.py`
-   passes every candidate value through the same canonical+nostereo
-   transformation as the TSV / JSON keys, eliminating the small
-   fraction of Molpher-augmentation outputs with explicit-H notation.
-   Idempotent.
+This release replaces the pretrain corpus with the MSG-aligned 4M pool
+(MCES2-disjoint with val + test, `data/pretrain_corpora/...`). The
+generated candidate chir distribution now matches GT essentially exactly:
 
-## Standardisation + recomputation
+|  | MSG-test GT | MSG-4M (new) | ChEMBL (old) |
+|---|---|---|---|
+| median chir | 1 | **1** | 0 |
+| mean chir | 2.44 | **2.00 / 2.19** (formula / mass) | 1.52 / 1.79 |
+| p(chir = 0) | 49 % | **44.5 / 45.4 %** | 58.7 / 54.1 % |
 
-`scripts/fixes/rdkit_canon_massspecgym.py` recomputes every column that
-depends on `smiles`:
+## Headline benchmark effect
 
-| column | recomputed from new SMILES |
-|---|---|
-| `smiles` | `Chem.MolToSmiles(mol, canonical=True, isomericSmiles=False)` |
-| `formula` | `rdMolDescriptors.CalcMolFormula(mol)` |
-| `inchikey` | first 14 chars of `InchiToInchiKey(MolToInchi(mol))` (the 2D-InChIKey convention used in v1) |
-| `parent_mass` | `rdMolDescriptors.CalcExactMolWt(mol)` |
-| `precursor_formula` | Hill-notation formula of (n_parents × new formula ± adduct ion components), via the same matchms adduct-parsing logic that built the v1 column |
+The chirality-count vs random hit@1 ratio (test fold):
 
-All other columns (`identifier`, `mzs`, `intensities`, `precursor_mz`,
-`adduct`, `instrument_type`, `collision_energy`, `fold`,
-`simulation_challenge`) are passed through unchanged.
+|  | random hit@1 | chirality hit@1 | **ratio** |
+|---|---|---|---|
+| Mass, OLD (ChEMBL) | 0.52 | 2.55 | **4.9×** ← artifact |
+| **Mass, NEW (MSG-4M)** | **0.31** | **0.47** | **1.5×** ← collapsed |
+| Formula, OLD | 1.82 | 2.01 | 1.10× |
+| Formula, NEW | 1.60 | 1.96 | 1.23× |
 
-## Coverage / completeness
+The benchmark-artifact chirality exploit is gone; structural priors
+sit at random as they should.
 
-| Property | Value |
-|---|---|
-| Spectra in TSV | 231,104 |
-| Spectra in MGF | 231,104 |
-| Unique stripped SMILES in TSV | 28,936 |
-| Queries in `candidates_formula.json` | 28,936 |
-| Queries in `candidates_mass.json` | 28,936 |
-| TSV rows whose `smiles` is a JSON key | **231,104 / 231,104 (100 %)** |
-| Mean candidates per formula bucket | 389.25 |
-| Mean candidates per mass bucket | 470.90 |
-| Buckets exceeding 512-cap | 0 |
-| Buckets with duplicate strings | 0 |
-| Query SMILES at index 0 of every bucket | ✓ |
-| Candidate values canonical (`MolToSmiles canonical=True, isomericSmiles=False`) | 99.99964 % (73 of 20,701,305 unique candidate strings flip between two equivalent forms under RDKit's own re-canonicalisation — pathological aromaticity edge cases, `canon(canon(s)) != canon(s)`. All parse to the correct molecule.) |
+## Pipeline scripts
+
+All under `MassSpecGym/scripts/fixes/` or
+`DreaMS-Mol/scripts/data_processing/`:
+
+1. `build_mces2_valtest_disjoint_pool.py` — MCES2-disjoint-with-val
+   filter on the published MSG-MCES2-test-disjoint 4M pool. Output:
+   `data/pretrain_corpora/MassSpecGym_molecules_MCES2_disjoint_with_valtest_4M.tsv` (3.91 M molecules; 8,304 removed for MCES ≤ 2 to val).
+2. `prep_msg4m_pretrain_zips.py` — standardise + 95/5 split the MCES2
+   pool ∪ MSG-train SMILES into pretrain zips (the MSG-train inclusion
+   makes the auto-built tokenizer cover MSG-train tokens → zero OOV
+   drops at finetune time).
+3. `DreaMS-Mol/scripts/data_processing/build_s4_candidates.py --stage
+   pretrain` with `--vocab-size 256 --sequence-length 160` —
+   pretrained on the MSG-4M corpus, 30 epochs, val_loss 0.179.
+4. `MassSpecGym/scripts/build_msg_s4_candidates.py --stage
+   {extract,prep_train,finetune,sample,bucket,emit_*}` — finetune on
+   MSG-train (now 0 OOV drops vs the old vocab's 15.5 %), then
+   200 M-sample × 3-temperature sweep, then bucket / formula+mass
+   emit.
+5. PubChem augment + Molpher augment + canonicalise (existing
+   pipeline).
+
+## SLURM submission scripts
+
+`experiments/data_builds/MassSpecGym_S4_v2/submit_s4v2_*.sh` — one
+per pipeline stage. Bad GPU nodes excluded; PYTORCH_HIP_ALLOC_CONF
+expandable_segments enabled.
 
 ## Notebooks
 
-- `notebooks/massspecgym_in_the_wild/candidates_analysis_final.ipynb`
-  — full pipeline / per-step contribution / quality / per-formula and
-  per-mass bucket-size distributions / qualitative examples /
-  comparison to PubChem v1.5 / sanity checks.
-- `notebooks/massspecgym_in_the_wild/v1.5_consistency_check.ipynb`
-  — direct row-by-row comparison of v1.5 TSV/MGF vs the original
-  PubChem-standardised `MassSpecGym.tsv` / `MassSpecGym.mgf`.
-  Confirms:
-  - 231,104 / 231,104 rows in both formats, no orphans.
-  - All TSV diffs are confined to the 5 SMILES-dependent columns the canon script recomputes. Headline numbers:
-    - `smiles` differs in 225,269 rows (97.475 %)
-    - `formula` 0 (0.000 %) — stereo-stripping preserves molecular formula
-    - `inchikey` 272 (0.118 %) — small differences from re-deriving 2D-IK
-    - `parent_mass` 46,540 (20.138 %) — most are RDKit float-precision noise (median |Δ| ≈ 5e-5 Da); ~58 rows show |Δ| > 1 Da where the original release stored an incorrect mass and the recomputation corrects it
-    - `precursor_formula` 58 (0.025 %) — adduct re-derivation edge cases
-  - MGF peak lists 100 % identical.
-  - MGF non-recomputed headers (`COLLISION_ENERGY`, `PRECURSOR_MZ`) show string-level diffs but max numeric residual 0.0 (matchms float `repr` reformat only).
+`notebooks/massspecgym_in_the_wild/` — the v1.5_consistency_check,
+candidates_analysis_final, and evaluation_s4 notebooks are being
+re-executed against this release; learnable-baseline retraining
+(ChemBERTa + DS/DS+FF/FP-FFN grid) is the remaining piece.
