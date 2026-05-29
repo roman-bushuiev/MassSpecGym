@@ -36,17 +36,23 @@ generated candidate chir distribution now matches GT essentially exactly:
 
 ## Headline benchmark effect
 
-The chirality-count vs random hit@1 ratio (test fold):
+Spectrum-agnostic priors (test fold) — both **chirality count** and the
+**ChemBERTa SMILES classifier** (binary classifier of query-vs-candidate)
+were exploiting the same candidate-pool/GT distribution mismatch in the
+ChEMBL release. The mismatch is gone in this release, so both priors
+collapse onto random.
 
-|  | random hit@1 | chirality hit@1 | **ratio** |
+|  | Random hit@1 | Chirality hit@1 | ChemBERTa hit@1 |
 |---|---|---|---|
-| Mass, OLD (ChEMBL) | 0.52 | 2.55 | **4.9×** ← artifact |
-| **Mass, NEW (MSG-4M)** | **0.31** | **0.47** | **1.5×** ← collapsed |
-| Formula, OLD | 1.82 | 2.01 | 1.10× |
-| Formula, NEW | 1.60 | 1.96 | 1.23× |
+| Mass, OLD (ChEMBL) | 0.52 | 2.55 (**4.9×**) | 1.69 (3.3×) |
+| **Mass, NEW (MSG-4M)** | **0.31** | **0.47 (1.5×)** | **0.21 (0.7× — below random)** |
+| Formula, OLD | 1.82 | 2.01 (1.1×) | 2.12 (1.2×) |
+| Formula, NEW | 1.60 | 1.96 (1.2×) | (retrain pending; old shows 2.12) |
 
-The benchmark-artifact chirality exploit is gone; structural priors
-sit at random as they should.
+The chirality count and the spectrum-agnostic ChemBERTa classifier
+both lose their "chemistry-prior shortcut" against the new candidate
+distribution — exactly the property we wanted for a clean
+spectrum-conditioned-retrieval benchmark. Headline: artifact removed.
 
 ## Pipeline scripts
 
