@@ -492,8 +492,11 @@ def _design_molecules_fast(s4, n_designs: int, batch_size: int, temperature: flo
                 row = designs[i]
                 tokens = []
                 for lab in row:
-                    tok = label2token[int(lab)]
-                    if tok in ("[BEG]", "[END]", "[PAD]"):
+                    # At high temperature the flattened distribution can sample
+                    # output indices with no real token (the model's output dim
+                    # exceeds the true vocabulary); skip them instead of crashing.
+                    tok = label2token.get(int(lab))
+                    if tok is None or tok in ("[BEG]", "[END]", "[PAD]"):
                         continue
                     tokens.append(tok)
                 mol_len = len(tokens) + 2
@@ -567,46 +570,101 @@ def _stage_sample(args):
 # -----------------------------------------------------------------------------
 
 def _stage_bucket(args):
+    """Dedup raw S4 samples into the candidate pool (``buckets.parquet``).
+
+    Memory-bounded + resumable so it scales from the 200M v2 pool to the 1B v3
+    pool. Three sub-steps, each checkpointed to disk under ``out_dir``:
+
+      1. ``_bucket_unique_raw.parquet`` — raw-SMILES dedup keeping max
+         log_likelihood, via a polars streaming ``group_by`` (the old
+         Python-dict + per-row ``itertuples`` loop OOM'd at 1B; pyarrow's
+         in-memory grouper overflows/aborts on >2 GB of string keys).
+      2. ``_bucket_canon_parts/canon_*.parquet`` — RDKit canonicalisation +
+         (ik2d, formula, exact_mass) over the unique raw SMILES, in resumable
+         chunks so a wall-clock timeout never loses completed work.
+      3. ``buckets.parquet`` — global dedup by 2D-InChIKey keeping the
+         max-log_likelihood row, via a polars streaming ``group_by``. Identical
+         schema/semantics to the previous version.
+
+    ``temperature`` is carried as ``max`` over a molecule's occurrences; it is
+    metadata only (no downstream stage reads it), so exact provenance of the
+    max-likelihood temperature is not preserved.
+    """
+    import polars as pl
+
     bucket_path = args.out_dir / "buckets.parquet"
     if bucket_path.exists() and not args.force:
         print(f"[bucket] {bucket_path} exists; skipping")
         return bucket_path
 
     samples_dir = args.out_dir / "samples"
-    shard_paths = sorted(samples_dir.glob("temp_*/shard_*.parquet"))
+    shard_paths = [str(p) for p in sorted(samples_dir.glob("temp_*/shard_*.parquet"))]
     print(f"[bucket] {len(shard_paths):,} sample shards")
 
-    seen: dict[str, tuple[float, float]] = {}  # raw_smi -> (best_ll, temp)
-    n_raw = 0
-    for sp in shard_paths:
-        df = pd.read_parquet(sp, columns=["smiles", "log_likelihood", "temperature"])
-        n_raw += len(df)
-        for smi, ll, t in df.itertuples(index=False, name=None):
-            cur = seen.get(smi)
-            if cur is None or ll > cur[0]:
-                seen[smi] = (float(ll), float(t))
-    print(f"[bucket] raw rows={n_raw:,}  unique raw smiles={len(seen):,}")
+    # --- step 1: raw-SMILES dedup keeping max log_likelihood (polars stream) --
+    uniq_path = args.out_dir / "_bucket_unique_raw.parquet"
+    if uniq_path.exists() and not args.force:
+        print(f"[bucket] reusing {uniq_path.name}")
+    else:
+        t0 = time.perf_counter()
+        n_raw = pl.scan_parquet(shard_paths).select(pl.len()).collect().item()
+        (pl.scan_parquet(shard_paths)
+           .group_by("smiles")
+           .agg([pl.col("log_likelihood").max(), pl.col("temperature").max()])
+           .sink_parquet(uniq_path))
+        n_uniq = pq.ParquetFile(uniq_path).metadata.num_rows
+        print(f"[bucket] raw rows={n_raw:,}  unique raw smiles={n_uniq:,}  "
+              f"({time.perf_counter()-t0:.1f}s)")
 
-    items = [(smi, smi) for smi in seen]
-    print(f"[bucket] canonicalizing + computing formula/ik2d/mass via worker pool ({args.n_workers}) ...")
-    t0 = time.perf_counter()
-    results = _run_pool(items, args.n_workers, _worker_canon_full)
-    print(f"[bucket]   done in {time.perf_counter() - t0:.1f}s")
-
-    rows = []
-    for raw_smi, std_smi, ik2d, formula, mass in results:
-        if not (std_smi and ik2d and formula and mass is not None):
+    # --- step 2: canonicalize unique raw SMILES in resumable chunks -----------
+    # Stream the unique-raw table batch-by-batch (never materialise all SMILES in
+    # Python) and checkpoint one canon part per batch so a timeout loses nothing.
+    canon_dir = args.out_dir / "_bucket_canon_parts"
+    canon_dir.mkdir(exist_ok=True)
+    canon_schema = pa.schema([
+        ("smiles", pa.string()), ("inchikey_2d", pa.string()), ("formula", pa.string()),
+        ("exact_mass", pa.float64()), ("log_likelihood", pa.float32()), ("temperature", pa.float32()),
+    ])
+    CHUNK = 8_000_000
+    pf = pq.ParquetFile(uniq_path)
+    print(f"[bucket] canonicalizing {pf.metadata.num_rows:,} unique raw SMILES "
+          f"(batch={CHUNK:,}, workers={args.n_workers}) ...")
+    for ci, batch in enumerate(pf.iter_batches(batch_size=CHUNK,
+                                               columns=["smiles", "log_likelihood", "temperature"])):
+        part_path = canon_dir / f"canon_{ci:04d}.parquet"
+        if part_path.exists() and not args.force:
+            print(f"[bucket]   chunk {ci}: reuse {part_path.name}")
             continue
-        ll, temp = seen[raw_smi]
-        rows.append((std_smi, ik2d, formula, mass, ll, temp))
-    df_pool = pd.DataFrame(rows, columns=["smiles", "inchikey_2d", "formula", "exact_mass", "log_likelihood", "temperature"])
-    print(f"[bucket] survived standardization: {len(df_pool):,}")
+        smiles = batch.column("smiles").to_pylist()
+        ll_b = batch.column("log_likelihood").to_pylist()
+        temp_b = batch.column("temperature").to_pylist()
+        t0 = time.perf_counter()
+        results = _run_pool(list(enumerate(smiles)), args.n_workers, _worker_canon_full)
+        std_l, ik_l, f_l, m_l, ll_l, t_l = [], [], [], [], [], []
+        for key, std_smi, ik2d, formula, mass in results:
+            if not (std_smi and ik2d and formula and mass is not None):
+                continue
+            std_l.append(std_smi); ik_l.append(ik2d); f_l.append(formula)
+            m_l.append(mass); ll_l.append(ll_b[key]); t_l.append(temp_b[key])
+        part = pa.table({"smiles": std_l, "inchikey_2d": ik_l, "formula": f_l,
+                         "exact_mass": m_l, "log_likelihood": ll_l, "temperature": t_l},
+                        schema=canon_schema)
+        pq.write_table(part, part_path, compression="zstd")
+        print(f"[bucket]   chunk {ci}: {len(smiles):,} in -> {part.num_rows:,} valid "
+              f"({time.perf_counter()-t0:.1f}s)", flush=True)
 
-    df_pool = (df_pool.sort_values("log_likelihood", ascending=False)
-                       .drop_duplicates("inchikey_2d", keep="first")
-                       .reset_index(drop=True))
-    print(f"[bucket] after dedup by 2D-InChIKey: {len(df_pool):,}")
-    df_pool.to_parquet(bucket_path, compression="zstd")
+    # --- step 3: dedup by 2D-InChIKey keeping max-ll row ----------------------
+    # sort-desc-by-ll then keep first per ik2d == keep the max-ll row. Far faster
+    # than a grouped sort_by when keys are near-unique (~all groups size 1).
+    canon_glob = [str(p) for p in sorted(canon_dir.glob("canon_*.parquet"))]
+    n_canon = sum(pq.ParquetFile(p).metadata.num_rows for p in canon_glob)
+    print(f"[bucket] survived standardization: {n_canon:,}")
+    t0 = time.perf_counter()
+    df_pool = (pl.read_parquet(canon_glob)
+                 .sort("log_likelihood", descending=True)
+                 .unique(subset="inchikey_2d", keep="first", maintain_order=True))
+    df_pool.write_parquet(bucket_path)
+    print(f"[bucket] after dedup by 2D-InChIKey: {df_pool.height:,}  ({time.perf_counter()-t0:.1f}s)")
     print(f"[bucket] -> {bucket_path}")
     return bucket_path
 
