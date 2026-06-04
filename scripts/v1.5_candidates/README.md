@@ -12,6 +12,38 @@ A higher-level write-up of the motivation + the headline benchmark effect
 
 ---
 
+## Two candidate pools available
+
+The similarity-weighted sampler consumes one input: the deduped pool
+`buckets.parquet`. Two have been built — same schema, same generator
+(MSG-4M-pretrained S4), different scale. **Use the 1B pool** unless you have
+a reason not to; it is a drop-in replacement (point `--out-dir` at it).
+
+| Pool | Raw sampled | Temperatures | Deduped `buckets.parquet` | Size |
+|---|---|---|---|---|
+| 200M (v2) | 200 M | 0.7 / 1.0 / 1.2 | 59.6 M molecules | 2.1 GB |
+| **1B (v3)** | **1.0 B** | **0.7 / 1.0 / 1.2 / 1.5 / 2.0** (diversity-weighted) | **409.8 M molecules** | 15 GB |
+
+The 1B pool is **~6.9× larger** and far more diverse: its raw→unique
+fraction is 55% (vs 33% for the 200M pool) because sampling was skewed
+toward high temperature to fight saturation. 70% of its molecules are only
+reachable at T ≥ 1.5 — i.e. exactly the diverse decoys a similarity-weighted
+sampler benefits from. Caveat: the `temperature` column is the **max** temp
+at which each molecule was seen (metadata only; no stage reads it), so it
+reads as "highest temp needed to reach this molecule," not "the temp that
+produced it."
+
+Pool locations on LUMI (`experiments/data_builds/` is gitignored — these are
+data artefacts, transferred out-of-band, not committed):
+- 1B: `experiments/data_builds/MassSpecGym_S4_v3_1B/{buckets.parquet,extract_unique_mols.parquet}`
+- 200M: `experiments/data_builds/MassSpecGym_S4_v2/{buckets.parquet,extract_unique_mols.parquet}`
+
+> **Dependency:** the bucket stage now uses `polars` (streaming group_by) to
+> dedup at 1B scale — `pip install polars` in the venv. The emit/augment
+> stages you'll modify do not require it.
+
+---
+
 ## TL;DR for the collaborator
 
 **Goal:** replace the current **uniform-random** trim of per-query candidate
@@ -69,14 +101,14 @@ Then re-run `augment_s4_with_pubchem.py` + `augment_s4_with_molpher.py`
 `MassSpecGym1.5_retrieval_candidates_{formula,mass}.json`.
 
 The pretrain/finetune/sample stages **do not need to be re-run** — the
-deduped pool (`buckets.parquet`, 59.6 M rows) is the only input the
-sampler consumes.
+deduped pool (`buckets.parquet`, 409.8 M rows for the 1B pool) is the only
+input the sampler consumes.
 
-**Data files you'll be sent separately** (~2 GB total):
+**Data files you'll be sent separately** (1B pool ≈ 15 GB):
 
 | File | Purpose |
 |---|---|
-| `buckets.parquet` | the deduped S4 pool (59.6 M SMILES with `inchikey_2d, formula, exact_mass, log_likelihood, temperature`). The candidate universe. |
+| `buckets.parquet` | the deduped S4 pool (409.8 M SMILES for the 1B pool — or 59.6 M for the 200M pool — with `inchikey_2d, formula, exact_mass, log_likelihood, temperature`). The candidate universe. |
 | `extract_unique_mols.parquet` | the 28 936 MSG query molecules (`inchikey_2d, smiles, formula, exact_mass, fold`). |
 | `MassSpecGym1.5_retrieval_candidates_formula.json` | the current final formula candidates (uniform-trim reference). |
 | `MassSpecGym1.5_retrieval_candidates_mass.json` | the current final mass candidates (uniform-trim reference). |
