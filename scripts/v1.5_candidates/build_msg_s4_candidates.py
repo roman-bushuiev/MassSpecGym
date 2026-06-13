@@ -696,16 +696,18 @@ def _build_stereo_strip_map(unique_smiles: set[str], n_workers: int) -> dict[str
 
 def _stage_emit_formula_json(args):
     queries = pd.read_parquet(args.out_dir / "extract_unique_mols.parquet")
-    pool = pd.read_parquet(args.out_dir / "buckets.parquet")
+    pool = pd.read_parquet(args.out_dir / "buckets.parquet",
+                           columns=["smiles", "inchikey_2d", "formula", "exact_mass"])
     print(f"[emit_formula] queries={len(queries):,}  pool={len(pool):,}")
 
-    # Stereo-strip query + pool SMILES before forming candidate lists. 2D-InChIKey
-    # is stereo-invariant so the existing ik2d columns remain valid. Per-query
-    # dedup uses ik2d (not SMILES) so candidates with the same 2D structure as the
-    # query are excluded even if their canonical SMILES differs (e.g. tautomers).
-    smi2no = _build_stereo_strip_map(set(queries["smiles"]).union(pool["smiles"]), args.n_workers)
+    # Pool SMILES are already RDKit-canonical + stereo-stripped (bucket stage),
+    # so only the queries need stripping. Stripping all ~410M pool SMILES here is
+    # redundant and OOMs even a 480 GB node (MemoryError building the strip dict).
+    # 2D-InChIKey is stereo-invariant so the existing ik2d columns remain valid;
+    # per-query dedup uses ik2d (not SMILES).
+    smi2no = _build_stereo_strip_map(set(queries["smiles"]), args.n_workers)
     queries = queries.assign(smiles_no=queries["smiles"].map(smi2no)).dropna(subset=["smiles_no"]).reset_index(drop=True)
-    pool = pool.assign(smiles_no=pool["smiles"].map(smi2no)).dropna(subset=["smiles_no"]).reset_index(drop=True)
+    pool = pool.assign(smiles_no=pool["smiles"])
     print(f"[emit_formula] post-strip — queries={len(queries):,}  pool={len(pool):,}")
 
     formula_to_entries: dict[str, list[tuple[str, str]]] = {}
@@ -737,18 +739,22 @@ def _stage_emit_formula_json(args):
 
 def _stage_emit_mass_json(args):
     queries = pd.read_parquet(args.out_dir / "extract_unique_mols.parquet")
-    pool = pd.read_parquet(args.out_dir / "buckets.parquet")
+    pool = pd.read_parquet(args.out_dir / "buckets.parquet",
+                           columns=["smiles", "inchikey_2d", "formula", "exact_mass"])
     print(f"[emit_mass] queries={len(queries):,}  pool={len(pool):,}")
 
-    smi2no = _build_stereo_strip_map(set(queries["smiles"]).union(pool["smiles"]), args.n_workers)
+    # Pool already nostereo (see emit_formula); strip queries only to avoid OOM.
+    smi2no = _build_stereo_strip_map(set(queries["smiles"]), args.n_workers)
     queries = queries.assign(smiles_no=queries["smiles"].map(smi2no)).dropna(subset=["smiles_no"]).reset_index(drop=True)
-    pool = pool.assign(smiles_no=pool["smiles"].map(smi2no)).dropna(subset=["smiles_no"]).reset_index(drop=True)
+    pool = pool.assign(smiles_no=pool["smiles"])
     print(f"[emit_mass] post-strip — queries={len(queries):,}  pool={len(pool):,}")
 
     pool_sorted = pool.sort_values("exact_mass").reset_index(drop=True)
+    del pool
     masses = pool_sorted["exact_mass"].to_numpy()
     smiles_no = pool_sorted["smiles_no"].to_numpy()
     iks = pool_sorted["inchikey_2d"].to_numpy()
+    del pool_sorted
 
     rng = random.Random(0)
     out: dict[str, list[str]] = {}

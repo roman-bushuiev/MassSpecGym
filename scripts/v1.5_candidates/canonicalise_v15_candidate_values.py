@@ -120,8 +120,15 @@ def process_json(path: Path) -> None:
 
 
 def main() -> None:
-    for name in ("formula", "mass"):
-        process_json(V15 / f"MassSpecGym1.5_retrieval_candidates_{name}.json")
+    import argparse
+    p = argparse.ArgumentParser()
+    p.add_argument("--formula-json", type=Path,
+                   default=V15 / "MassSpecGym1.5_retrieval_candidates_formula.json")
+    p.add_argument("--mass-json", type=Path,
+                   default=V15 / "MassSpecGym1.5_retrieval_candidates_mass.json")
+    args = p.parse_args()
+    for path in (args.formula_json, args.mass_json):
+        process_json(path)
     log.info("=" * 60)
     log.info("DONE.")
 

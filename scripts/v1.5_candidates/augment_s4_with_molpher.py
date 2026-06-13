@@ -33,22 +33,29 @@ from molpher.core.morphing import Molpher
 from molpher.core.morphing.operators import RerouteBond
 from tqdm import tqdm
 
-DATA = Path("/pfs/lustrep2/scratch/project_465002061/rbushuie/DreaMS-Mol_dev/MassSpecGym/data")
-IN_JSON = DATA / "MassSpecGym_S4plusPC_retrieval_candidates_formula.json"
-OUT_JSON = DATA / "MassSpecGym_S4plusPCplusMol_retrieval_candidates_formula.json"
-CHECKPOINT_JSON = DATA / "MassSpecGym_S4plusPCplusMol_checkpoint.json"
+DATA = Path(os.environ.get(
+    "MSG_DATA_DIR",
+    "/pfs/lustrep2/scratch/project_465003029/rbushuie/DreaMS-Mol_dev/MassSpecGym/data",
+))
+IN_JSON = DATA / "MassSpecGym_S4plusPC_retrieval_candidates_formula_nostereo.json"
+OUT_JSON = DATA / "MassSpecGym_S4plusPCplusMol_retrieval_candidates_formula_nostereo.json"
+CHECKPOINT_JSON = DATA / "MassSpecGym_S4plusPCplusMol_checkpoint_nostereo.json"
 
 THRESHOLD = 8
-CAP = 1024
+CAP = 512
 MOLPHER_ATTEMPTS = 10_000
 RANDOM_SEED = 42
 N_WORKERS = int(os.environ.get("WORKERS", 32))
 CHECKPOINT_INTERVAL = 50
+# Per-query wall-clock cap. RerouteBond morphing can hang in molpher's C++ core
+# on pathological molecules; such queries are abandoned (left unfilled) so one
+# bad input can't stall the whole job.
+MORPH_TIMEOUT = int(os.environ.get("MORPH_TIMEOUT", 180))
 
 
 def canonicalize(smi: str) -> str:
     m = Chem.MolFromSmiles(smi)
-    return Chem.MolToSmiles(m, canonical=True) if m else smi
+    return Chem.MolToSmiles(m, canonical=True, isomericSmiles=False) if m else smi
 
 
 def inchikey_2d(smi: str) -> str | None:
@@ -113,7 +120,7 @@ def generate_morphs(query: str, existing_canon: set[str], max_needed: int) -> li
             ik2d = Chem.MolToInchiKey(rd_mol).split("-")[0]
             if ik2d == query_ik2d:
                 return
-            smi = Chem.MolToSmiles(rd_mol, canonical=True)
+            smi = Chem.MolToSmiles(rd_mol, canonical=True, isomericSmiles=False)
             if smi in existing_canon or smi in collected:
                 return
             collected[smi] = rd_mol
@@ -181,6 +188,19 @@ def save_checkpoint(data: dict, p: Path) -> None:
 
 
 def main() -> None:
+    global IN_JSON, OUT_JSON, CHECKPOINT_JSON, THRESHOLD, CAP, N_WORKERS
+    import argparse
+    p = argparse.ArgumentParser()
+    p.add_argument("--in-json", type=Path, default=IN_JSON)
+    p.add_argument("--out-json", type=Path, default=OUT_JSON)
+    p.add_argument("--checkpoint", type=Path, default=CHECKPOINT_JSON)
+    p.add_argument("--threshold", type=int, default=THRESHOLD)
+    p.add_argument("--cap", type=int, default=CAP)
+    p.add_argument("--workers", type=int, default=N_WORKERS)
+    a = p.parse_args()
+    IN_JSON, OUT_JSON, CHECKPOINT_JSON = a.in_json, a.out_json, a.checkpoint
+    THRESHOLD, CAP, N_WORKERS = a.threshold, a.cap, a.workers
+
     random.seed(RANDOM_SEED)
     RDLogger.DisableLog("rdApp.*")
     logging.info(f"Loading {IN_JSON} ...")
@@ -203,20 +223,34 @@ def main() -> None:
 
     total_added = 0
     n_aug = 0
+    n_timeout = 0
     if tasks:
         workers = min(N_WORKERS, multiprocessing.cpu_count())
-        logging.info(f"using {workers} workers")
-        with multiprocessing.Pool(processes=workers) as pool:
-            iterator = pool.imap_unordered(process_one, tasks)
-            for i, (q, new_list, n_added) in enumerate(tqdm(iterator, total=len(tasks))):
-                updated[q] = new_list
-                checkpoint[q] = new_list
-                total_added += n_added
-                if n_added > 0:
-                    n_aug += 1
-                if (i + 1) % CHECKPOINT_INTERVAL == 0:
-                    save_checkpoint(checkpoint, CHECKPOINT_JSON)
-                    logging.info(f"Checkpoint: {i + 1}/{len(tasks)} processed, {total_added:,} morphs added")
+        logging.info(f"using {workers} workers (per-query timeout {MORPH_TIMEOUT}s)")
+        # apply_async + per-task .get(timeout) so a single hung morph can't stall
+        # the job: the stuck worker is abandoned and the query left unfilled.
+        pool = multiprocessing.Pool(processes=workers)
+        asyncs = [(q, pool.apply_async(process_one, ((q, c),))) for q, c in tasks]
+        pool.close()
+        for i, (q, ar) in enumerate(tqdm(asyncs, total=len(asyncs))):
+            try:
+                _, new_list, n_added = ar.get(timeout=MORPH_TIMEOUT)
+            except multiprocessing.TimeoutError:
+                new_list, n_added = cands[q], 0
+                n_timeout += 1
+                logging.warning(f"molpher timeout, left unfilled: {q[:70]}")
+            updated[q] = new_list
+            checkpoint[q] = new_list
+            total_added += n_added
+            if n_added > 0:
+                n_aug += 1
+            if (i + 1) % CHECKPOINT_INTERVAL == 0:
+                save_checkpoint(checkpoint, CHECKPOINT_JSON)
+                logging.info(f"Checkpoint: {i + 1}/{len(asyncs)} processed, {total_added:,} morphs added, {n_timeout} timeouts")
+        pool.terminate()  # kill workers still stuck on a hung C++ morph
+        pool.join()
+        if n_timeout:
+            logging.info(f"queries left unfilled due to timeout: {n_timeout}")
 
     logging.info(f"Molpher fill done. {n_aug:,}/{len(short):,} queries got new morphs; "
                  f"{total_added:,} morphs added total.")
