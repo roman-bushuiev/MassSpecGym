@@ -45,7 +45,7 @@ class FingerprintFFNRetrieval(RetrievalMassSpecGymModel):
         # Unpack inputs
         x = batch["spec"]
         fp_true = batch["mol"]
-        cands = batch["candidates"]
+        cands = batch["candidates_mol"]
         batch_ptr = batch["batch_ptr"]
 
         # Predict fingerprint

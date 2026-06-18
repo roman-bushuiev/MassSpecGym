@@ -3,6 +3,14 @@ import datetime
 import typing as T
 from pathlib import Path
 
+import torch as _torch
+_torch.serialization.add_safe_globals([getattr])
+_orig_torch_load = _torch.load
+def _patched_torch_load(*args, **kwargs):
+    kwargs.setdefault("weights_only", False)
+    return _orig_torch_load(*args, **kwargs)
+_torch.load = _patched_torch_load
+
 from rdkit import RDLogger
 import pytorch_lightning as pl
 from pytorch_lightning import Trainer
@@ -11,7 +19,7 @@ from pytorch_lightning.callbacks.early_stopping import EarlyStopping
 import massspecgym.utils as utils
 from massspecgym.data import RetrievalDataset, MassSpecDataset, MassSpecDataModule
 from massspecgym.data.transforms import (
-    MolFingerprinter, SpecBinner, SpecTokenizer, MolToFormulaVector
+    MolFingerprinter, SpecBinner, SpecTokenizer, MolToFormulaVector, MolToInChIKey
 )
 from massspecgym.models.base import Stage
 from massspecgym.models.retrieval import (
@@ -78,6 +86,13 @@ parser.add_argument('--task', type=str, choices=['retrieval', 'de_novo', 'simula
 parser.add_argument('--model', type=str, required=True)
 parser.add_argument('--log_only_loss_at_stages', default=(),
     type=lambda stages: [Stage(s) for s in stages.strip().replace(' ', '').split(',')])
+parser.add_argument('--skip_mces_on_test', action='store_true',
+    help='Skip the expensive MCES@1 per-batch evaluation during test stage. '
+         'retrieval hit_rate@k and df_test_pth are still produced.')
+parser.add_argument('--mol_fp_cache_pth', type=Path, default=None,
+    help='HDF5 cache of SMILES -> Morgan FP. Wraps mol_transform in InMemCachedMolTransform.')
+parser.add_argument('--mol_ik2d_cache_pth', type=Path, default=None,
+    help='Pickle cache of SMILES -> 2D-InChIKey. Wraps mol_label_transform in InMemCachedMolTransform.')
 parser.add_argument('--df_test_pth', type=Path, default=None)
 parser.add_argument('--checkpoint_pth', type=Path, default=None)
 
@@ -139,10 +154,63 @@ def main(args):
             spec_transform = SpecBinner(max_mz=args.max_mz, bin_width=args.bin_width)
         else:
             spec_transform = SpecTokenizer(n_peaks=args.n_peaks, matchms_kwargs=dict(mz_to=args.max_mz))
+
+        mol_transform = MolFingerprinter(fp_size=args.fp_size)
+        mol_label_transform = MolToInChIKey()
+        if args.mol_fp_cache_pth is not None:
+            # Cache stores bit-packed (4096 bits → 512 bytes per FP); unpack on retrieval.
+            import numpy as _np
+            from massspecgym.data.transforms import InMemCachedMolTransform, MolTransform as _MolTransform
+
+            class _PackedTorchMolFingerprinter(_MolTransform):
+                """Bit-packed MolFingerprinter for cache build path.
+
+                Identical bits to MolFingerprinter('morgan', fp_size), but
+                packed into uint8 bytes so the HDF5 cache uses fp_size/8
+                bytes per molecule instead of fp_size.
+                """
+                def __init__(self, fp_size, radius):
+                    self._inner = MolFingerprinter(type="morgan", fp_size=fp_size, radius=radius)
+
+                def from_smiles(self, smi):
+                    arr = self._inner.from_smiles(smi).astype("uint8")
+                    packed = _np.packbits(arr)
+                    return _torch.as_tensor(packed)
+
+            inner_cache = InMemCachedMolTransform(
+                cache_pth=args.mol_fp_cache_pth,
+                mol_transform=_PackedTorchMolFingerprinter(fp_size=args.fp_size, radius=2),
+                output_dtype=_torch.uint8,
+                tensor_dtype="uint8",
+                verbose=True,
+            )
+
+            class _CachedFingerprintUnpacker(_MolTransform):
+                """Wraps a packed cache and unpacks at lookup time to (fp_size,) float32."""
+                def __init__(self, packed_cache, fp_size):
+                    self._cache = packed_cache
+                    self._fp_size = fp_size
+
+                def from_smiles(self, smi):
+                    packed = self._cache.from_smiles(smi)
+                    # packed is shape (fp_size/8,) uint8 tensor
+                    unpacked = _np.unpackbits(packed.numpy())[: self._fp_size]
+                    return _torch.from_numpy(unpacked.astype("float32"))
+
+            mol_transform = _CachedFingerprintUnpacker(inner_cache, args.fp_size)
+        if args.mol_ik2d_cache_pth is not None:
+            from massspecgym.data.transforms import InMemCachedMolTransform
+            mol_label_transform = InMemCachedMolTransform(
+                cache_pth=args.mol_ik2d_cache_pth,
+                mol_transform=mol_label_transform,
+                verbose=True,
+            )
+
         dataset = RetrievalDataset(
             pth=args.dataset_pth,
             spec_transform=spec_transform,
-            mol_transform=MolFingerprinter(fp_size=args.fp_size),
+            mol_transform=mol_transform,
+            mol_label_transform=mol_label_transform,
             candidates_pth=args.candidates_pth,
         )
     elif args.task == 'de_novo':
@@ -239,6 +307,12 @@ def main(args):
             log_only_loss_at_stages=args.log_only_loss_at_stages,
             df_test_path=args.df_test_pth
         )
+
+    if getattr(args, "skip_mces_on_test", False):
+        from massspecgym.models.base import Stage as _Stage
+        if _Stage.TEST not in model.no_mces_metrics_at_stages:
+            model.no_mces_metrics_at_stages = list(model.no_mces_metrics_at_stages) + [_Stage.TEST]
+        print(f"skip_mces_on_test=True; no_mces_metrics_at_stages={model.no_mces_metrics_at_stages}")
 
     # Init logger
     if args.no_wandb:

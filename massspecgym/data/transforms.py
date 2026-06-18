@@ -244,6 +244,11 @@ class MolFingerprinter(MolTransform):
 
     def from_smiles(self, smiles: str):
         mol = Chem.MolFromSmiles(smiles)
+        if mol is None:
+            total = 0
+            for t in self.fp_types:
+                total += 167 if t == "maccs" else self.fp_size
+            return np.zeros(total, dtype=np.float32)
         fps = []
         for t in self.fp_types:
             if t == "morgan":
@@ -264,6 +269,8 @@ class MolToInChIKey(MolTransform):
 
     def from_smiles(self, mol: str) -> str:
         mol = Chem.MolFromSmiles(mol)
+        if mol is None:
+            return ""
         return utils.mol_to_inchi_key(mol, twod=self.twod)
 
 
@@ -554,7 +561,7 @@ class InMemCachedMolTransform(MolTransform):
 
         # Build dict in parallel without pickling mol_transform per task
         with self._pool(num_workers) as pool:
-            it = pool.imap_unordered(_transform_smiles_worker, smiles_list, chunksize=512)
+            it = pool.imap_unordered(_transform_smiles_worker, smiles_list, chunksize=16)
             cache = dict(
                 tqdm(it, total=len(smiles_list), disable=not self.verbose)
             )
@@ -570,7 +577,7 @@ class InMemCachedMolTransform(MolTransform):
         mat = np.empty((len(smiles_list), length), dtype=self.tensor_dtype)
 
         with self._pool(num_workers) as pool:
-            it = pool.imap_unordered(_transform_smiles_worker, smiles_list, chunksize=512)
+            it = pool.imap_unordered(_transform_smiles_worker, smiles_list, chunksize=16)
             for smi, val in tqdm(it, total=len(smiles_list), disable=not self.verbose):
                 if not isinstance(val, torch.Tensor) or val.ndim != 1:
                     raise TypeError("Transform output changed type; expected 1D torch.Tensor.")
