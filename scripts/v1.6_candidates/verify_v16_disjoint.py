@@ -121,14 +121,17 @@ def report(name, data, key2fold, P, key2ik, tani_thr, n_proc):
             for a in range(len(iks)):
                 if fps[a] is None:
                     continue
+                # train-only deleak: only TRAIN<->(val/test) pairs are the gate (val<->test is kept
+                # at v1.5 verbatim, so its overlap is expected and not counted here).
+                a_tr = ik_fold[iks[a]] == "train"
                 vb = [b for b in range(a + 1, len(iks))
-                      if ik_fold[iks[b]] != ik_fold[iks[a]] and fps[b] is not None]
+                      if ((ik_fold[iks[b]] == "train") != a_tr) and fps[b] is not None]
                 if not vb:
                     continue
                 sims = BulkTanimotoSimilarity(fps[a], [fps[b] for b in vb])
                 worst = max(worst, max(sims))
                 n_viol += int(sum(1 for s in sims if s >= tani_thr))
-        print(f"    cross-fold Tanimoto>={tani_thr} pairs: {n_viol}  (max cross-fold Tanimoto={worst:.3f})")
+        print(f"    train<->val/test Tanimoto>={tani_thr} pairs: {n_viol}  (max train<->val/test Tanimoto={worst:.3f})")
     return (tv, tt, vt)
 
 
