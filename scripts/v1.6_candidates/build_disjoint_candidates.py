@@ -227,6 +227,7 @@ def _stats(sizes):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--tsv", required=True, type=Path)
+    ap.add_argument("--mgf", type=Path, help="spectra MGF to copy into each output dir (same spectra as v1.5)")
     ap.add_argument("--buckets", required=True, type=Path)
     ap.add_argument("--out-root", required=True, type=Path, help="parent of v1.6inchi/ and v1.6mces/")
     ap.add_argument("--criteria", nargs="+", default=["inchi", "tani80"])
@@ -306,6 +307,8 @@ def main():
         print(f"[emit_mass:{criterion}]    trivial={tm:,}  {_stats(sm)}", flush=True)
         (out_dir / "MassSpecGym1.6_retrieval_candidates_mass.json").write_text(json.dumps(om))
         shutil.copy(args.tsv, out_dir / "MassSpecGym1.6.tsv")
+        if args.mgf and args.mgf.exists():
+            shutil.copy(args.mgf, out_dir / "MassSpecGym1.6.mgf")
         print(f"[done:{criterion}] wrote {out_dir}", flush=True)
 
 

@@ -27,7 +27,8 @@ NP="${SLURM_CPUS_PER_TASK:-32}"
 
 echo "Start: $(date)  node=$(hostname)  cores=${NP}"
 "${PY}" "${SCRIPT}" \
-    --tsv "${TSV}" --buckets "${BUCKETS}" --out-root "${OUT_ROOT}" \
+    --tsv "${TSV}" --mgf "${OUT_ROOT}/v1.5/MassSpecGym1.5.mgf" \
+    --buckets "${BUCKETS}" --out-root "${OUT_ROOT}" \
     --criteria inchi tani80 --tani-threshold 0.80 --n-workers "${NP}"
 echo "Done: $(date)"
 echo "Outputs:"
