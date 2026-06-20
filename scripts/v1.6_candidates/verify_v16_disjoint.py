@@ -92,7 +92,7 @@ def report(name, data, key2fold, P, key2ik, tani_thr, n_proc):
     gt_leak = (len(gt["val"] & fold_iks["train"]) + len(gt["test"] & fold_iks["train"])
                + len(gt["train"] & (fold_iks["val"] | fold_iks["test"])))
     print(f"    GT-as-cross-fold-decoy: {gt_leak}")
-    if tani_thr and (tv + tt + vt) == 0:
+    if tani_thr and (tv + tt) == 0:   # train exact-clean; now confirm train<->val/test Tanimoto gate
         # cross-fold near-dup gate: count cross-fold decoy pairs with Tanimoto >= tani_thr (per
         # formula; should be 0 for a tani-disjoint set). No MCES.
         ik_fold, ik_smi = {}, {}
