@@ -511,7 +511,7 @@ def _stage_sample(args):
     """Each invocation handles ONE task-id slice across all temperatures. Each
     ``chunk_size`` block is written to its own parquet shard so progress
     survives crashes — shards are named ``shard_{task_id:03d}_{chunk:05d}.parquet``."""
-    src_ckpt = args.out_dir / "ckpt_finetune_msg"
+    src_ckpt = args.sample_ckpt if args.sample_ckpt is not None else args.out_dir / "ckpt_finetune_msg"
     samples_dir = args.out_dir / "samples"
     samples_dir.mkdir(parents=True, exist_ok=True)
 
@@ -798,6 +798,9 @@ def main():
     p.add_argument("--out-formula-json", type=Path, default=DEFAULT_FORMULA_JSON)
     p.add_argument("--out-mass-json", type=Path, default=DEFAULT_MASS_JSON)
     p.add_argument("--pretrain-ckpt", type=Path, default=DEFAULT_PRETRAIN_CKPT)
+    p.add_argument("--sample-ckpt", type=Path, default=None,
+                   help="checkpoint dir to SAMPLE from (default: <out-dir>/ckpt_finetune_msg). "
+                        "Set to a pretrain-only ckpt to ablate the MSG-train finetune.")
     p.add_argument("--s4-repo", type=Path, default=DEFAULT_S4_REPO)
 
     # S4 hyperparams.
