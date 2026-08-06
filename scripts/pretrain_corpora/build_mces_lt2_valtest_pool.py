@@ -45,8 +45,15 @@ from rdkit import Chem, RDLogger
 RDLogger.logger().setLevel(RDLogger.CRITICAL)
 csv.field_size_limit(sys.maxsize)
 
-SCREEN_L1 = 2               # sound bound is 1 for d<2 and 2 for d<=2; we use 2 throughout
 SLOW_PAIR_SECONDS = 30.0    # log any pair whose solve exceeds this
+
+# Screen soundness, general form. Every bond weight in the MCES objective is >= 1, so `MCES <= T`
+# admits at most T unmapped bonds. An unmapped atom needs all its bonds unmapped, and detaching k
+# atoms from a CONNECTED graph costs at least k bonds (k-1 internal + 1 attachment), so at most T
+# atoms go unmapped and the heavy-atom formula L1 distance is <= T.
+#   d < 2   -> at most 1 unmapped bond  -> L1 <= 1   (we screen at 2, margin)
+#   d <= 2  -> at most 2                -> L1 <= 2
+#   d <= 3  -> at most 3                -> L1 <= 3   <- a wider rule NEEDS a wider screen
 
 # The rule and the solver threshold must be chosen together, because MCES_ILP returns the
 # threshold value itself when the problem is infeasible:
@@ -56,8 +63,11 @@ SLOW_PAIR_SECONDS = 30.0    # log any pair whose solve exceeds this
 #             this is the bug in the superseded builder). Use threshold 3: then values <= 2 are
 #             ILP-optimal and exact, and the sentinel moves to 3.0.
 RULES = {
-    "lt2":  {"threshold": 2, "remove_below": 2.0, "remove_equal": False},
-    "lte2": {"threshold": 3, "remove_below": 2.0, "remove_equal": True},
+    "lt2":  {"threshold": 2, "remove_below": 2.0, "remove_equal": False, "screen_l1": 2},
+    "lte2": {"threshold": 3, "remove_below": 2.0, "remove_equal": True,  "screen_l1": 2},
+    # lte3 is a CONTROL, not a corpus rule: if a <= 3 scan also returns nothing, the pipeline is
+    # broken rather than the pool being clean.
+    "lte3": {"threshold": 4, "remove_below": 3.0, "remove_equal": True,  "screen_l1": 3},
 }
 
 
@@ -175,17 +185,21 @@ def stage_prep(args):
     print(f"  wrote {args.cache}", flush=True)
 
     counts = np.bincount(pool_fidx[pool_fidx >= 0], minlength=len(uniq))
-    tot = 0
-    for qi in range(len(queries)):
-        near = np.where(np.abs(F_uniq - F_q[qi][None, :]).sum(axis=1) <= SCREEN_L1)[0]
-        tot += int(counts[near].sum())
-    print(f"\nCANDIDATE PAIRS (heavy L1 <= {SCREEN_L1}): {tot:,}", flush=True)
-    print(f"  ~{tot/len(queries):,.0f} pool molecules per query", flush=True)
+    sizes = {}
+    for screen in sorted({r["screen_l1"] for r in RULES.values()}):
+        tot = 0
+        for qi in range(len(queries)):
+            near = np.where(np.abs(F_uniq - F_q[qi][None, :]).sum(axis=1) <= screen)[0]
+            tot += int(counts[near].sum())
+        sizes[screen] = tot
+        print(f"\nCANDIDATE PAIRS (heavy L1 <= {screen}): {tot:,}", flush=True)
+        print(f"  ~{tot/len(queries):,.0f} pool molecules per query", flush=True)
+    tot = sizes[min(sizes)]
     print(f"  brute force for comparison: {len(pool_smiles)*len(queries):,}", flush=True)
     (args.cache.with_suffix(".plan.json")).write_text(json.dumps({
         "pool": str(args.pool), "pool_size": len(pool_smiles), "n_queries": len(queries),
         "n_val": folds.count("val"), "n_test": folds.count("test"),
-        "screen_l1": SCREEN_L1, "candidate_pairs": tot,
+        "candidate_pairs_by_screen": sizes,
         "bruteforce_pairs": len(pool_smiles) * len(queries),
     }, indent=2))
 
@@ -204,8 +218,9 @@ def stage_score(args):
 
     rule = RULES[args.rule]
     thr, below, eq = rule["threshold"], rule["remove_below"], rule["remove_equal"]
+    screen = rule["screen_l1"]
     print(f"  rule={args.rule}: remove d < {below}" + (f" or d == {below}" if eq else "")
-          + f"; solver threshold={thr}", flush=True)
+          + f"; solver threshold={thr}; heavy-atom L1 screen <= {screen}", flush=True)
 
     def is_hit(d):
         return d < below - 1e-9 or (eq and abs(d - below) <= 1e-9)
@@ -231,7 +246,7 @@ def stage_score(args):
         for n, qi in enumerate(mine, 1):
             if qi in done:
                 continue
-            near = np.where(np.abs(F_uniq - F_q[qi][None, :]).sum(axis=1) <= SCREEN_L1)[0]
+            near = np.where(np.abs(F_uniq - F_q[qi][None, :]).sum(axis=1) <= screen)[0]
             cand = [i for fi in near for i in by_formula.get(int(fi), ())]
             q_smi = queries[qi]
             tasks = [(q_smi, pool_smiles[i], i, thr) for i in cand]
