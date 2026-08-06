@@ -3,6 +3,23 @@
 Optimized version: builds a dense numpy matrix of (formula_id × element_count),
 then uses vectorised L1-distance scan to find near-formula matches in O(n) per
 val molecule.
+
+TWO KNOWN DEFECTS, both quantified by `verify_mces2_disjointness.py` (audit
+2026-08-06, `experiments/reports/data-eda/2026-08-06_pretrain-4m-mces2-audit/`):
+
+1. **The comparison sign does not match MassSpecGym's.** This script removes
+   `d <= 2` (line ~158); MassSpecGym's published pool removes `d < 2` from the
+   test fold (NeurIPS 2024 §2.6, confirmed by measurement: 1,733 surviving
+   test pairs at exactly d = 2, none below). The resulting corpus is therefore
+   cleaned one shell more strictly against val than against test.
+
+2. **The candidate pre-filter is incomplete.** `formula_counter` calls
+   `Chem.AddHs`, so the L1 <= max_delta screen below is over *hydrogen-inclusive*
+   formulas — but MCES runs on the heavy-atom graph, where `d <= 2` only implies
+   a *heavy-atom* L1 <= 2. The with-H screen is a strict subset of that bound, so
+   pairs such as a CH2 homolog (d = 1, with-H L1 = 3) or a CH3<->Cl swap
+   (d = 2, with-H L1 = 5) are never scored. Use `--prefilter heavy` semantics
+   (heavy-atom formula) if rebuilding.
 """
 from __future__ import annotations
 
