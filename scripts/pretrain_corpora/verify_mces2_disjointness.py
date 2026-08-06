@@ -160,7 +160,7 @@ def rescore_hits(path: Path, thr: int, workers: int, out: Path):
         w.writeheader()
         for r, d in zip(rows, ds):
             w.writerow({"query_smiles": r["query_smiles"], "pool_smiles": r["pool_smiles"],
-                        "mces_thr2": r["mces"], "mces_rescored": d})
+                        "mces_thr2": r.get("mces", ""), "mces_rescored": d})
     print(json.dumps(res, indent=2), flush=True)
     return res
 
