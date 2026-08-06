@@ -45,9 +45,20 @@ from rdkit import Chem, RDLogger
 RDLogger.logger().setLevel(RDLogger.CRITICAL)
 csv.field_size_limit(sys.maxsize)
 
-REMOVE_BELOW = 2.0          # strict: remove d < 2, keep d == 2
-SCREEN_L1 = 2               # sound bound is 1; 2 is margin
+SCREEN_L1 = 2               # sound bound is 1 for d<2 and 2 for d<=2; we use 2 throughout
 SLOW_PAIR_SECONDS = 30.0    # log any pair whose solve exceeds this
+
+# The rule and the solver threshold must be chosen together, because MCES_ILP returns the
+# threshold value itself when the problem is infeasible:
+#   "< 2"  -> threshold 2 is exact. Below-2 values are ILP-optimal; a returned 2.0 is not < 2
+#             whether it means "exactly 2" or "> 2", so the rule is unaffected.
+#   "<= 2" -> threshold 2 would be WRONG (every sentinel 2.0 gets removed, including far pairs —
+#             this is the bug in the superseded builder). Use threshold 3: then values <= 2 are
+#             ILP-optimal and exact, and the sentinel moves to 3.0.
+RULES = {
+    "lt2":  {"threshold": 2, "remove_below": 2.0, "remove_equal": False},
+    "lte2": {"threshold": 3, "remove_below": 2.0, "remove_equal": True},
+}
 
 
 def read_tsv_cols(path: Path, cols):
@@ -88,11 +99,11 @@ def _worker_init():
 
 def _score(args):
     """No timeLimit — matches MassSpecGym's MyopicMCES default. A time limit would let CBC stop
-    early and return the `threshold` sentinel, which reads as ">= 2" and silently under-removes."""
-    q_smi, p_smi, p_idx = args
+    early and return the `threshold` sentinel, which reads as "far" and silently under-removes."""
+    q_smi, p_smi, p_idx, thr = args
     t0 = time.perf_counter()
     try:
-        d = _MCES_FN(s1=q_smi, s2=p_smi, ind=0, threshold=2, always_stronger_bound=True,
+        d = _MCES_FN(s1=q_smi, s2=p_smi, ind=0, threshold=thr, always_stronger_bound=True,
                      solver=_SOLVER, solver_options={"msg": 0})[1]
         return (p_idx, float(d), time.perf_counter() - t0, "")
     except Exception as exc:
@@ -191,6 +202,14 @@ def stage_score(args):
         if fi >= 0:
             by_formula[int(fi)].append(idx)
 
+    rule = RULES[args.rule]
+    thr, below, eq = rule["threshold"], rule["remove_below"], rule["remove_equal"]
+    print(f"  rule={args.rule}: remove d < {below}" + (f" or d == {below}" if eq else "")
+          + f"; solver threshold={thr}", flush=True)
+
+    def is_hit(d):
+        return d < below - 1e-9 or (eq and abs(d - below) <= 1e-9)
+
     mine = list(range(args.shard, len(queries), args.nshards))
     out_hits = args.out_dir / f"hits_{args.shard:04d}.tsv"
     out_done = args.out_dir / f"done_{args.shard:04d}.txt"
@@ -215,14 +234,14 @@ def stage_score(args):
             near = np.where(np.abs(F_uniq - F_q[qi][None, :]).sum(axis=1) <= SCREEN_L1)[0]
             cand = [i for fi in near for i in by_formula.get(int(fi), ())]
             q_smi = queries[qi]
-            tasks = [(q_smi, pool_smiles[i], i) for i in cand]
+            tasks = [(q_smi, pool_smiles[i], i, thr) for i in cand]
             n_pairs += len(tasks)
             for p_idx, d, secs, err in pool.imap_unordered(_score, tasks, chunksize=8):
                 if err:
                     n_err += 1
                 if secs > SLOW_PAIR_SECONDS:
                     slow.append({"query": q_smi, "pool": pool_smiles[p_idx], "seconds": round(secs, 1)})
-                if d < REMOVE_BELOW:
+                if is_hit(d):
                     n_hits += 1
                     w.writerow([q_smi, pool_smiles[p_idx], p_idx, d, folds[qi]])
             fh.flush()
@@ -235,7 +254,8 @@ def stage_score(args):
                       f"ETA {el/max(n,1)*(len(mine)-n)/60:.1f}m", flush=True)
 
     (args.out_dir / f"stats_{args.shard:04d}.json").write_text(json.dumps({
-        "shard": args.shard, "nshards": args.nshards, "queries": len(mine),
+        "shard": args.shard, "nshards": args.nshards, "rule": args.rule,
+        "solver_threshold": thr, "queries": len(mine),
         "pairs": n_pairs, "hits": n_hits, "errors": n_err,
         "slow_pairs": slow, "seconds": round(time.perf_counter() - t_start, 1),
     }, indent=2))
@@ -327,6 +347,9 @@ def main():
     ap.add_argument("--out", type=Path)
     ap.add_argument("--shard", type=int, default=0)
     ap.add_argument("--nshards", type=int, default=1)
+    ap.add_argument("--rule", choices=sorted(RULES), default="lt2",
+                    help="lt2 = remove MCES < 2 (MassSpecGym's stated rule); "
+                         "lte2 = remove MCES <= 2 (what the published artifact actually is)")
     ap.add_argument("--workers", type=int, default=128)
     args = ap.parse_args()
     if args.stage == "prep":
