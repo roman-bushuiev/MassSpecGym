@@ -243,10 +243,21 @@ def stage_score(args):
 
 
 def stage_assemble(args):
-    hits, stats = [], []
+    # A shard killed mid-query re-runs that query on resume, so the same (query, pool) hit can be
+    # appended twice. Harmless for the drop set, but it would inflate the reported pair counts.
+    seen, hits, stats = set(), [], []
+    n_dup = 0
     for f in sorted(args.out_dir.glob("hits_*.tsv")):
         with open(f, newline="") as fh:
-            hits.extend(list(csv.DictReader(fh, delimiter="\t")))
+            for row in csv.DictReader(fh, delimiter="\t"):
+                key = (row["query_smiles"], row["pool_idx"])
+                if key in seen:
+                    n_dup += 1
+                    continue
+                seen.add(key)
+                hits.append(row)
+    if n_dup:
+        print(f"  dropped {n_dup:,} duplicate hit rows from resumed shards", flush=True)
     for f in sorted(args.out_dir.glob("stats_*.json")):
         stats.append(json.loads(f.read_text()))
     n_shards_done = len(stats)
