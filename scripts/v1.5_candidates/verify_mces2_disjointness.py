@@ -101,6 +101,70 @@ def _mces_pair(args):
         return (q_idx, p_idx, float("inf"))
 
 
+def _rescore_worker_init():
+    import pulp
+    from myopic_mces.myopic_mces import MCES
+
+    global _MCES_FN, _SOLVER
+    _MCES_FN = MCES
+    _SOLVER = pulp.listSolvers(onlyAvailable=True)[0]
+
+
+def _rescore_pair(args):
+    """Re-measure a pair at a HIGHER threshold to disambiguate the builder's `d <= 2` verdict.
+
+    `MCES_ILP` constrains the objective to <= threshold and returns `threshold` itself when the
+    problem is infeasible (true distance above it) or the solver stops early. At threshold=2 a
+    returned 2.0 therefore conflates "exactly 2" with "> 2, unproven". Re-running at threshold T
+    moves that sentinel to T, so any value < T is the exact distance.
+    """
+    q_smi, p_smi, thr = args
+    try:
+        d = _MCES_FN(
+            s1=q_smi, s2=p_smi, ind=0, threshold=thr, always_stronger_bound=True,
+            solver=_SOLVER, solver_options={"msg": 0, "timeLimit": 60},
+        )[1]
+        return float(d)
+    except Exception:
+        return float("nan")
+
+
+def rescore_hits(path: Path, thr: int, workers: int, out: Path):
+    rows = list(csv.DictReader(open(path, newline=""), delimiter="\t"))
+    print(f"Re-scoring {len(rows):,} pairs from {path.name} at threshold={thr} ...", flush=True)
+    args = [(r["query_smiles"], r["pool_smiles"], thr) for r in rows]
+    t0 = time.perf_counter()
+    ctx = get_context("fork")
+    with ctx.Pool(workers, initializer=_rescore_worker_init) as p:
+        ds = []
+        for i, d in enumerate(p.imap(_rescore_pair, args, chunksize=4), 1):
+            ds.append(d)
+            if i % 200 == 0:
+                el = time.perf_counter() - t0
+                print(f"  {i:,}/{len(rows):,}  {i/max(el,1):.1f}/s  el={el/60:.1f}m", flush=True)
+    hist = Counter(round(d, 3) for d in ds)
+    n_exact2 = sum(1 for d in ds if abs(d - 2) <= EPS)
+    n_lt2 = sum(1 for d in ds if d < 2 - EPS)
+    n_gt2 = sum(1 for d in ds if d > 2 + EPS)
+    res = {
+        "source": str(path), "rescore_threshold": thr, "n_pairs": len(rows),
+        "n_true_lt2": n_lt2, "n_true_eq2": n_exact2, "n_true_gt2": n_gt2,
+        "n_at_sentinel": int(hist.get(float(thr), 0)),
+        "histogram": {str(k): v for k, v in sorted(hist.items())},
+    }
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(res, indent=2))
+    fields = ["query_smiles", "pool_smiles", "mces_thr2", "mces_rescored"]
+    with open(out.with_suffix(".tsv"), "w", newline="") as fh:
+        w = csv.DictWriter(fh, fieldnames=fields, delimiter="\t")
+        w.writeheader()
+        for r, d in zip(rows, ds):
+            w.writerow({"query_smiles": r["query_smiles"], "pool_smiles": r["pool_smiles"],
+                        "mces_thr2": r["mces"], "mces_rescored": d})
+    print(json.dumps(res, indent=2), flush=True)
+    return res
+
+
 def _vec(key, elements):
     v = np.zeros(len(elements), dtype=np.int32)
     if key is None:
@@ -220,6 +284,10 @@ def run_selftest(workers):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--selftest", action="store_true", help="run the MCES semantics self-test and exit")
+    ap.add_argument("--rescore-hits", type=Path, default=None,
+                    help="a *.hits.tsv from a previous run; re-measure each pair at a higher "
+                         "threshold to separate a true distance of 2 from the threshold sentinel")
+    ap.add_argument("--rescore-threshold", type=int, default=3)
     ap.add_argument("--pool", type=Path, help="pool TSV with a `smiles` column")
     ap.add_argument("--drop-smiles", type=Path, default=None,
                     help="optional TSV of SMILES to drop from --pool (reconstructs the cleaned pool)")
@@ -239,6 +307,11 @@ def main():
 
     if args.selftest:
         raise SystemExit(0 if run_selftest(args.workers) else 1)
+    if args.rescore_hits is not None:
+        if args.out is None:
+            ap.error("--out is required with --rescore-hits")
+        rescore_hits(args.rescore_hits, args.rescore_threshold, args.workers, args.out)
+        raise SystemExit(0)
     for req in ("pool", "msg_tsv", "fold", "out"):
         if getattr(args, req) is None:
             ap.error(f"--{req.replace('_', '-')} is required unless --selftest")
