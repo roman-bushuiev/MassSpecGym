@@ -118,21 +118,23 @@ def _rescore_pair(args):
     returned 2.0 therefore conflates "exactly 2" with "> 2, unproven". Re-running at threshold T
     moves that sentinel to T, so any value < T is the exact distance.
     """
-    q_smi, p_smi, thr = args
+    q_smi, p_smi, thr, tlim = args
+    opts = {"msg": 0} if not tlim else {"msg": 0, "timeLimit": tlim}
     try:
         d = _MCES_FN(
             s1=q_smi, s2=p_smi, ind=0, threshold=thr, always_stronger_bound=True,
-            solver=_SOLVER, solver_options={"msg": 0, "timeLimit": 60},
+            solver=_SOLVER, solver_options=opts,
         )[1]
         return float(d)
     except Exception:
         return float("nan")
 
 
-def rescore_hits(path: Path, thr: int, workers: int, out: Path):
+def rescore_hits(path: Path, thr: int, workers: int, out: Path, tlim: int = 0):
     rows = list(csv.DictReader(open(path, newline=""), delimiter="\t"))
-    print(f"Re-scoring {len(rows):,} pairs from {path.name} at threshold={thr} ...", flush=True)
-    args = [(r["query_smiles"], r["pool_smiles"], thr) for r in rows]
+    print(f"Re-scoring {len(rows):,} pairs from {path.name} at threshold={thr}, "
+          f"timeLimit={tlim or 'none'} ...", flush=True)
+    args = [(r["query_smiles"], r["pool_smiles"], thr, tlim) for r in rows]
     t0 = time.perf_counter()
     ctx = get_context("fork")
     with ctx.Pool(workers, initializer=_rescore_worker_init) as p:
@@ -147,7 +149,8 @@ def rescore_hits(path: Path, thr: int, workers: int, out: Path):
     n_lt2 = sum(1 for d in ds if d < 2 - EPS)
     n_gt2 = sum(1 for d in ds if d > 2 + EPS)
     res = {
-        "source": str(path), "rescore_threshold": thr, "n_pairs": len(rows),
+        "source": str(path), "rescore_threshold": thr, "time_limit": tlim or None,
+        "n_pairs": len(rows),
         "n_true_lt2": n_lt2, "n_true_eq2": n_exact2, "n_true_gt2": n_gt2,
         "n_at_sentinel": int(hist.get(float(thr), 0)),
         "histogram": {str(k): v for k, v in sorted(hist.items())},
@@ -288,6 +291,9 @@ def main():
                     help="a *.hits.tsv from a previous run; re-measure each pair at a higher "
                          "threshold to separate a true distance of 2 from the threshold sentinel")
     ap.add_argument("--rescore-threshold", type=int, default=3)
+    ap.add_argument("--rescore-timelimit", type=int, default=0,
+                    help="CBC seconds; 0 = none. A limit makes a timeout indistinguishable "
+                         "from infeasibility, since both return the threshold value.")
     ap.add_argument("--pool", type=Path, help="pool TSV with a `smiles` column")
     ap.add_argument("--drop-smiles", type=Path, default=None,
                     help="optional TSV of SMILES to drop from --pool (reconstructs the cleaned pool)")
@@ -310,7 +316,8 @@ def main():
     if args.rescore_hits is not None:
         if args.out is None:
             ap.error("--out is required with --rescore-hits")
-        rescore_hits(args.rescore_hits, args.rescore_threshold, args.workers, args.out)
+        rescore_hits(args.rescore_hits, args.rescore_threshold, args.workers, args.out,
+                     args.rescore_timelimit)
         raise SystemExit(0)
     for req in ("pool", "msg_tsv", "fold", "out"):
         if getattr(args, req) is None:
