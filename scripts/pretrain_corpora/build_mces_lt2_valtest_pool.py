@@ -181,7 +181,8 @@ def stage_prep(args):
     args.cache.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(args.cache, F_uniq=F_uniq, F_q=F_q, pool_fidx=pool_fidx,
                         elements=np.array(elements), queries=np.array(queries),
-                        folds=np.array(folds))
+                        folds=np.array(folds), pool_name=np.array(Path(args.pool).name),
+                        pool_rows=np.array(len(pool_smiles)))
     print(f"  wrote {args.cache}", flush=True)
 
     counts = np.bincount(pool_fidx[pool_fidx >= 0], minlength=len(uniq))
@@ -210,6 +211,14 @@ def stage_score(args):
     queries = [str(s) for s in z["queries"]]
     folds = [str(f) for f in z["folds"]]
     pool_smiles = read_tsv_cols(args.pool, ["smiles"])["smiles"]
+    # The cache indexes the pool by ROW ORDER. Scoring a different file, or one whose row count
+    # changed, would silently map every hit to the wrong molecule.
+    if "pool_rows" in z and int(z["pool_rows"]) != len(pool_smiles):
+        raise SystemExit(f"ABORT: cache built from {int(z['pool_rows']):,} rows, --pool has "
+                         f"{len(pool_smiles):,}. Re-run --stage prep.")
+    if "pool_name" in z and str(z["pool_name"]) != Path(args.pool).name:
+        raise SystemExit(f"ABORT: cache built from {str(z['pool_name'])}, not "
+                         f"{Path(args.pool).name}. Re-run --stage prep.")
 
     by_formula = defaultdict(list)
     for idx, fi in enumerate(pool_fidx):
@@ -308,6 +317,12 @@ def stage_assemble(args):
         raise SystemExit(f"ABORT: {tot_err} pair(s) raised; the corpus would be under-filtered.")
 
     drop = {int(h["pool_idx"]) for h in hits}
+    pool_smiles = read_tsv_cols(args.pool, ["smiles"])["smiles"]
+    bad = [h for h in hits if pool_smiles[int(h["pool_idx"])] != h["pool_smiles"]]
+    if bad:
+        raise SystemExit(f"ABORT: {len(bad)} hit row(s) have a pool_idx that does not point at the "
+                         f"recorded SMILES — index/order mismatch between score and assemble.")
+    print(f"  index check: all {len(hits):,} hit rows map to their recorded SMILES", flush=True)
     by_fold = Counter(h["fold"] for h in hits)
     drop_val = {int(h["pool_idx"]) for h in hits if h["fold"] == "val"}
     drop_test = {int(h["pool_idx"]) for h in hits if h["fold"] == "test"}
