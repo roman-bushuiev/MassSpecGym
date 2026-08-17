@@ -4,11 +4,40 @@ from abc import ABC
 import pandas as pd
 import torch
 from torchmetrics import CosineSimilarity, MeanMetric
-from torchmetrics.functional.retrieval import retrieval_hit_rate
 from torch_geometric.utils import unbatch
 
 from massspecgym.models.base import MassSpecGymModel, Stage
 import massspecgym.utils as utils
+
+
+def hit_rate_fair_ties(scores: torch.Tensor, labels: torch.Tensor, top_k: int) -> float:
+    """hit@`top_k` for one spectrum, averaged over the orderings a tie leaves undefined.
+
+    `torchmetrics.retrieval_hit_rate` ranks with a plain sort, whose order among EQUAL scores is an
+    unspecified implementation detail that varies with version, device and layout. Candidate lists are
+    assembled ground-truth-first, so whatever the sort does with ties lands systematically on the
+    ground truth: a fully collapsed score vector reads hit@1 = 0.0 here and hit@5 = 1.0 for a 10-way
+    tie, where the honest answers are 1/32 and 1/2.
+
+    Expected hit@k under a uniformly random order within the tied block:
+
+        clip(k - n_better, 0, n_tie) / n_tie
+
+    With no ties this is EXACTLY the plain metric (n_tie == 1, n_better == rank - 1 -> 1.0 iff
+    rank <= k), so tie-free models -- which is every neural method we run -- are unaffected bit for
+    bit, and no branch is needed. Same formula as the offline leaderboard
+    (DreaMS-Mol dreams_mol/eval/retrieval/, EVAL_SETUP.md), so training-time and leaderboard hit@k
+    are now directly comparable.
+
+    `n_better` / `n_tie` are taken against the BEST-scoring true candidate, so a sample with more
+    than one correct candidate is handled the same way a ranking metric would.
+    """
+    if not bool(labels.any()):
+        return 0.0
+    gt = scores[labels.bool()].max()
+    n_better = int((scores > gt).sum())
+    n_tie = int((scores == gt).sum())
+    return min(max(top_k - n_better, 0), n_tie) / n_tie
 
 
 class RetrievalMassSpecGymModel(MassSpecGymModel, ABC):
@@ -97,7 +126,7 @@ class RetrievalMassSpecGymModel(MassSpecGymModel, ABC):
         for at_k in self.at_ks:
             hit_rates = []
             for scores_sample, labels_sample in zip(scores, labels):
-                hit_rates.append(retrieval_hit_rate(scores_sample, labels_sample, top_k=at_k))
+                hit_rates.append(hit_rate_fair_ties(scores_sample, labels_sample, at_k))
             hit_rates = torch.tensor(hit_rates, device=batch_ptr.device)
 
             metric_name = f"{stage.to_pref()}hit_rate@{at_k}"
